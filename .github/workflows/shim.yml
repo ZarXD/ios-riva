@@ -5,10 +5,10 @@ on:
     inputs:
       kernel_run_id:
         description: XNU workflow run ID to download kernel.development.santoni from
-        default: "39727548958"
+        default: "39747460593"
       kernel_repo:
         description: Repository that owns the XNU workflow run
-        default: "console-ramoops/ios-santoni"
+        default: "ZarXD/ios-riva"
   push:
     branches: [riva]
     paths:
@@ -27,11 +27,11 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q clang lld llvm python3
 
-      - name: Download prebuilt XNU kernel from run ${{ inputs.kernel_run_id || '39727548958' }}
+      - name: Download prebuilt XNU kernel from run ${{ inputs.kernel_run_id || '39747460593' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh run download ${{ inputs.kernel_run_id || '39727548958' }} -R "${{ inputs.kernel_repo || 'console-ramoops/ios-santoni' }}" -n xnu-kernel -D xnu/out
+          gh run download ${{ inputs.kernel_run_id || '39747460593' }} -R "${{ inputs.kernel_repo || 'ZarXD/ios-riva' }}" -n xnu-kernel -D xnu/out
           ls -la xnu/out
 
       - name: Build riva shim-boot.img
