@@ -1,6 +1,56 @@
-# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+# iOS 16 on riva (Xiaomi Redmi 5A, MSM8917) & santoni (Redmi 4X, MSM8937) - working notes
 
-## SDHCI vendor window fix confirmed, CMD0 still inhibited (2026-10-22, latest): missing power + reset-all
+## Redmi 5A (`riva`, MSM8917) Port, Boot 1 & Boot 2 Hardware Logs, and JEDEC Standby CID/CSD Fix (2026-10-22, latest)
+
+- **Target Hardware (`riva` - Xiaomi Redmi 5A, 2 GB / 16 GB, Qualcomm MSM8917 / Snapdragon 425):**
+  - **CPU Topology:** 4× Cortex-A53 in a single cluster (`MPIDR 0x100..0x103`, boot CPU `0x100`, `cluster = 0` in ADT). Unlike 8-core `santoni` (MSM8937), `riva` has no second cluster.
+  - **DRAM Layout (Critical Difference vs 3 GB `santoni`):** 2 GiB total at `0x80000000..0xBFFFFFFF` and `0xC0000000..0xFFFFFFFF`. Unlike 3 GB `santoni`, **`riva` has NO DRAM at `0x20000000..0x3FFFFFFF`**; GiB 0 (`0x00000000..0x3FFFFFFF`) is strictly MMIO/BootROM (`DEV_FLAGS` / `Device-nGnRnE` in `shim/mmu.c`). XPU `no-map` carve-outs sit at `0x84a00000..0x8d500000`; XNU kernel window `PHYS_BASE = 0x98000000, MEM_SIZE = 0x28000000` (640 MiB) is 100% clean DRAM.
+  - **Continuous Splash Framebuffer:** Verified by disassembling `aboot.mbn` (`0x347a0: add r8, r8, #0x1000` on `0x90000000`) -> `FB_BASE = 0x90001000` (720×1280 24-bit BGR, stride 2160).
+  - **Core MMIO:** `GICD = 0x0b000000`, `GICC = 0x0b002000`, `WDT = 0x0b017000`, `SDCC1 = 0x07824000` (HC at `0x07824900`), `IMEM_RESTART_REASON = 0x0860065c`, `PSHOLD = 0x004ab000`.
+  - **Appended DTB Table:** Extracted 3 MSM8917/QM215 DTBs (984,705 B) from stock `riva` boot image into `shim/board/riva_appended_dtbs.bin`.
+- **Complete Partition & EFS/IMEI Backup (`backup/riva-3c5d9bca7d84/`, git-ignored):**
+  - Backed up primary & backup GPT (`gpt_primary_1M.bin`, `gpt_backup_1M.bin`) plus all **45 partitions** (`modemst1`, `modemst2`, `fsg`, `fsc`, `persist`, `aboot`, `boot`, `recovery`, `sbl1`, `tz`, `rpm`, `modem`, `dsp`, `splash`, `devinfo`, `config`, `sec`, etc. — 47 files, 429.26 MB total) and verified 100% bit-exact SHA256 hashes (`SHA256SUMS.txt`) against `/dev/block/mmcblk0*`.
+- **Boot 1 on Physical Redmi 5A (`riva`) (`shim-boot.img` SHA256 `6f17f12e...`, commit `1307fc3`):**
+  - **Milestone:** XNU-8796 booted all the way through Mach/BSD/Skywalk/IOKit to **userspace PID 1 on the very first hardware try** (`* RIVA userspace: init running as PID 1 *`, `RIVA init: still alive (tick)`).
+  - **SDHCI status on Boot 1:** Built before `0da5dc8` was merged; SDHCI timed out on `CMD13`, `CMD5`, and `CMD0` (`CMD0 did not complete either: no SDCLK reaches the card`, `SANTONI: eMMC probe failed (6)`).
+- **Boot 2 on Physical Redmi 5A (`riva`) (`shim-boot.img` SHA256 `5eb9d42a...`, commit `07d6f88` with `0da5dc8` merged):**
+  - **Hardware observation on `riva`:**
+    ```text
+    SANTONI SDHCI: core MCI_VERSION 0x1000004d
+    SANTONI SDHCI: CORE_VENDOR_SPEC 0x00353b1c (MCLK sel 3, PWRSAVE 0) -> POR 0x00018a9c
+    SANTONI SDHCI: HC mode enabled (HC_MODE 0x00000001, HOST_VERSION 0x4d02)
+    SANTONI SDHCI: PWRCTL stale: STATUS 0x00000002 -> CTL 0x00000001
+    SANTONI SDHCI: PWRCTL BUS_OFF: no request (STATUS 0x00000000), already in that state
+    SANTONI SDHCI: HC clock source MCLK sel 2 (VENDOR_SPEC 0x00018a9c)
+    SANTONI SDHCI: PWRCTL BUS_ON: STATUS 0x00000002 -> CTL 0x00000001
+    SANTONI SDHCI: card clock gate was closed, enabled (CLOCK_CONTROL 0x0007)
+    SANTONI SDHCI: CORE_DLL_CONFIG 0x6000642c CORE_DLL_STATUS 0x00000000 (DLL_EN 0, PDN 1, RST 1, LOCK 0, CK_OUT_EN 0)
+    SANTONI SDHCI: takeover complete (HC_MODE 0x00000001, VENDOR_SPEC 0x00018a9c, ...)
+    ...
+    SANTONI SDHCI: CMD5 awake RCA 2 -> R1 0x000015b0
+    SANTONI SDHCI: CMD13 after wake-up (R1 0x00000700, state 3)
+    SANTONI SDHCI: card state 3 (not TRAN), R1 0x00000700
+    SANTONI SDHCI: selecting RCA 2 (CMD7)
+    SANTONI SDHCI: command 10 failed (arg 0x00020000, INT_STATUS 0x00018000, PRESENT_STATE 0x01f80000)
+    SANTONI: eMMC probe failed (5), continuing
+    ```
+  - **What succeeded in Boot 2:**
+    1. `0da5dc8` power-on (`0x0B`), reset-all, and `0x18a9c` pad-power preservation brought the SDCC1 HC command shifter and card clock to life on `riva`.
+    2. `CMD5` (`SLEEP_AWAKE`) woke the sleeping eMMC at `RCA 2` (`R1 0x000015b0`).
+    3. `CMD13` (`SEND_STATUS`) answered immediately with `R1 0x00000700` (**Standby State, `state == 3`**).
+    4. `CMD7` (`SELECT_CARD`) selected `RCA 2` and transitioned the card from **Standby (`state 3`)** into **Transfer (`state 4`, `TRAN`)**, verified by the follow-up `CMD13` in `sdhci_restore_state()`.
+    5. No `host bus width not 8-bit` warning was printed, confirming `SDHCI_HOST_CONTROL` already held `SDHCI_CTRL_8BITBUS` (`0x20`).
+  - **Root cause of `command 10 failed (INT_STATUS 0x00018000)`:**
+    1. **JEDEC eMMC 5.1 (JESD84-B51 Section 6.10.4, Table 28):** `CMD9` (`SEND_CSD`) and `CMD10` (`SEND_CID`) are **only legal in Standby State (`state == 3`)**. Once `CMD7` selects the card into Transfer State (`state == 4`, `TRAN`), the card is forbidden from answering `CMD9`/`CMD10`.
+    2. Because `sdhci_claim_card()` called `sdhci_restore_state()` (which issued `CMD7` to enter `state 4`) *before* `sdhci_card_check()` issued `CMD10` and `CMD9`, the eMMC ignored `CMD10` and the host controller raised Command Timeout (`INT_STATUS 0x00018000`).
+    3. Additionally, `SDHCI_INT_CMD_TIMEOUT` in `0142` was mistakenly defined at `0x04000000u` instead of SDHCI 3.0 bit 16 (`0x00010000u`), which is why `0x00018000` (`SDHCI_INT_ERR | SDHCI_INT_CMD_TIMEOUT`) was not decoded as `cmd-timeout` in the log.
+- **Implemented Fix (commit `dd5489d`, CI run `39731529704`):**
+  1. `sdhci_restore_state()` now queries `CMD10` (`SEND_CID`) and `CMD9` (`SEND_CSD`) while the card is in **Standby State (`state == 3`)** *before* issuing `CMD7` (`sdhci_select_card(se.rca)`) to enter `TRAN` (`state == 4`), caching the 128-bit responses in `se.cid`/`se.csd`.
+  2. In `sdhci_card_check()`, if `se.have_cid_csd` is not set (e.g. if a card was handed off already in `TRAN`), `CMD10`/`CMD9` are attempted best-effort with `sdhci_reset_paths()` on failure rather than aborting the eMMC probe.
+  3. Fixed `SDHCI_INT_CMD_TIMEOUT` (`0x00010000u`), `SDHCI_INT_CMD_CRC` (`0x00020000u`), `SDHCI_INT_CMD_END_BIT` (`0x00040000u`), and `SDHCI_INT_CMD_INDEX` (`0x00080000u`) in `0142-santoni-sdhci-emmc-driver.patch` and `tests/test_sdhci_mock.c`.
+  4. Added `CMD8` (`SEND_EXT_CSD`) bus-width retry (toggling `SDHCI_CTRL_8BITBUS` in `SDHCI_HOST_CONTROL` if the first `CMD8` PIO read fails) plus `INT_STATUS` logging in `sdhci_wait_data()`.
+
+## SDHCI vendor window fix confirmed, CMD0 still inhibited (2026-10-22, previous): missing power + reset-all
 
 - **Hardware observation (Redmi 4X, boot of the image built from `c52abc4`/`077816f`):**
   - `CORE_VENDOR_SPEC` at `0x07824a0c` now reads the *real* LK value
