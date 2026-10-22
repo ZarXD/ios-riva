@@ -1,6 +1,6 @@
 # iOS 16 on riva (Xiaomi Redmi 5A, MSM8917) & santoni (Redmi 4X, MSM8937) - working notes
 
-## Redmi 5A (`riva`, MSM8917) Port, Boot 1–3 Hardware Logs, Upstream `c9f7c07` Merge, and 50 MHz HS SDR / R2 Fix (2026-10-22, latest)
+## Redmi 5A (`riva`, MSM8917) Port, Boot 1–4 Hardware Logs, Upstream `c9f7c07` Merge, and Boot 5 Fix (2026-10-22, latest)
 
 - **Target Hardware (`riva` - Xiaomi Redmi 5A, 2 GB / 16 GB, Qualcomm MSM8917 / Snapdragon 425):**
   - **CPU Topology:** 4× Cortex-A53 in a single cluster (`MPIDR 0x100..0x103`, boot CPU `0x100`, `cluster = 0` in ADT). Unlike 8-core `santoni` (MSM8937), `riva` has no second cluster.
@@ -32,11 +32,27 @@
     ```
   - **Root causes exposed by Boot 3 + `aboot.mbn` disassembly:**
     1. **Why `CMD10`/`CMD9` failed even in `state 3` (`Standby`):** `sdhci_read_response128()` passed `SDHCI_CMD_INDEX` (`0x10`). Per SDHCI Spec 2.2.6 Table 2-6 and Linux (`MMC_RSP_R2 = MMC_RSP_PRESENT | MMC_RSP_136 | MMC_RSP_CRC`), 136-bit `R2` responses have `111111b` (`0x3F`) in bits `[133:128]` instead of the command index, so setting `SDHCI_CMD_INDEX` causes the controller to reject the valid response with `SDHCI_INT_CMD_INDEX`!
-    2. **Why `CMD8` (`SEND_EXT_CSD`) and `CMD18` got `INT_STATUS 0x00208000` (`SDHCI_INT_DATA_CRC`):**
-       - First, before upstream `c9787f2`, `SDHCI_RESET_ALL` wiped `SDHCI_HOST_CONTROL2` (`0x3e`, including `SDHCI_CTRL_VDD_180` 1.8V signaling).
-       - Second, disassembling `riva`'s `aboot.mbn` (`ftbl_gcc_sdcc1_apps_clk` at `VA 0x8f670298`, `sdc1_clk_src` at `VA 0x8f66fcc8`) proved that `aboot` puts the eMMC to sleep in **HS400 mode** (`EXT_CSD[185]=3` HS400, `EXT_CSD[183]=6` 8-bit DDR, `GCC_SDCC1_APPS_CFG_RCGR = 0x0205` = **384 MHz** from `GPLL4`) and then powers down the DLL (`CORE_DLL_CONFIG = 0x6000642c`).
-       - In JEDEC eMMC 5.1, the `CMD` line is always SDR (so `CMD5`, `CMD13`, `CMD7`, and `CMD8`'s command phase succeed), whereas `DAT[7:0]` is driven in 8-bit DDR by the woken card while the host is in SDR bypass with the DLL off!
-       - Lowering `GCC_SDCC1_APPS_CFG_RCGR` (`0x01842008`) to `0x0000011f` (**50 MHz**, `GPLL0 / 16`, exact entry from `aboot.mbn` `ftbl_gcc_sdcc1_apps_clk`) when the DLL is bypassed, and issuing `CMD6` (`0x03b90100` `HS_TIMING=1` High-Speed SDR + `0x03b70200` `BUS_WIDTH=2` 8-bit SDR) when `CMD8` sees a DDR/SDR mismatch, aligns both the clock frequency (50 MHz) and `DAT[7:0]` framing (8-bit SDR).
+    2. **Why `CMD8` (`SEND_EXT_CSD`) and `CMD18` got `INT_STATUS 0x00200000` (`SDHCI_INT_DATA_CRC`):**
+       - Disassembling `riva`'s `aboot.mbn` (`ftbl_gcc_sdcc1_apps_clk` at `VA 0x8f670298`, `sdc1_clk_src` at `VA 0x8f66fcc8`) proved that `aboot` puts the eMMC to sleep in **HS200/HS400 mode** (`GCC_SDCC1_APPS_CFG_RCGR = 0x00000205` = **384 MHz** from `GPLL4`, `src_sel = 2`, `src_div = 5`) and powers down the DLL (`CORE_DLL_CONFIG = 0x6000642c`).
+       - In JEDEC eMMC 5.1, the `CMD` line is always SDR (so `CMD5`, `CMD13`, `CMD7`, and `CMD8`'s command phase succeed), whereas `DAT[7:0]` is driven at HS200/HS400 timing by the woken card while the host is in SDR bypass with the DLL off!
+- **Boot 4 on Physical Redmi 5A (`riva`) (`shim-boot.img` SHA256 `f5eb88b5...`, commit `e08d2ca`, `Screenshot 2026-10-22 141237.png`):**
+  - Merged upstream `c9f7c07` (`c9787f2`) and switched `GCC_SDCC1_APPS_CFG_RCGR` from `0x00000205` to `0x0000011f` during `sdhci_take_over()`.
+  - **Hardware observation on Boot 4:**
+    ```text
+    SANTONI SDHCI: GCC CFG_RCGR 0x00000205 -> 0x0000011f (50 MHz)
+    SANTONI SDHCI: takeover complete (HC_MODE 0x00000001, VENDOR_SPEC 0x00018a9c, legacy MCI_CLK 0x89000000, MCI_POWER 0x00000041, POWER_CONTROL 0x0b, CLOCK_CONTROL 0x0007, HOST_CONTROL 0x20, HOST_CONTROL2 0x0003, TIMEOUT_CONTROL 0x0f)
+    ...
+    SANTONI SDHCI: command 5 failed (arg 0x00020000, INT_STATUS 0x00018000, PRESENT_STATE 0x01e80007)
+    SANTONI SDHCI: CMD0 completed: the command path shifts, but no addressed command answered
+    ```
+  - **Why `CMD5` timed out on RX in Boot 4 after succeeding in Boot 2 and Boot 3:**
+    1. **`HOST_CONTROL2 = 0x0003` (`UHS_SDR104 / HS200` with DLL powered down):** Upstream `c9787f2` saved `handoff_hc2` (`0x0003` on `riva`, where bits `[2:0] = 3` select `SDR104 / HS200`) before `RESET_ALL` and restored it afterward. In Boot 2 and Boot 3, `RESET_ALL` cleared `HOST_CONTROL2` to **`0x0000`** (`SDR12` legacy SDR). On Qualcomm SDCC v4, setting `HOST_CONTROL2` UHS mode to `3` (`SDR104 / HS200`) while `CORE_DLL_CONFIG` has `DLL_EN=0, PDN=1, RST=1` routes the RX sampling clock through the powered-down tuning DLL! Notice `PRESENT_STATE` on `CMD5 (RCA 2)` changed from `0x01f80001` to **`0x01e80007`** (`DAT0` level bit 20 went `1 -> 0` and `DAT_ACTIVE` / `DATA_INHIBIT` asserted): the eMMC card **actually received `CMD5` and pulled `DAT0` low to wake up**, but the host RX path was deafened by `HOST_CONTROL2 = 0x0003` (and switching `CFG_RCGR` off `GPLL4` `src_sel = 2` during takeover)!
+  - **Boot 5 Fix:**
+    1. In `sdhci_take_over()`, clear the UHS mode bits `[2:0]` (`0x0007u`) from `handoff_hc2` whenever `!(hc_rd(CORE_DLL_CONFIG) & CORE_DLL_EN)` (`0x0003 -> 0x0000` on `riva`, while preserving `0x0008` in `test_sdhci_mock.c`), and leave `GCC_SDCC1_APPS_CFG_RCGR` untouched at `0x00000205` during takeover so `CMD5` -> `CMD13` -> `CMD10`/`CMD9` (without `SDHCI_CMD_INDEX`) -> `CMD7` run in the exact controller state proven by Boot 2 and Boot 3.
+    2. In `sdhci_card_check()`, once the card is in Transfer State (`state 4`), try `CMD8` (`SEND_EXT_CSD`) with a 3-stage fallback:
+       - Stage 1: `sdhci_switch_to_hs_sdr(false, false)` — send `CMD6` (`0x03b90100u` `HS_TIMING=1` High-Speed SDR + `0x03b70200u` `BUS_WIDTH=2` 8-bit SDR) with `HOST_CONTROL2 = se.saved_hc2` (`0x0000`) and `HOST_CONTROL = 0x20`.
+       - Stage 2: `sdhci_switch_to_hs_sdr(true, false)` — divide the active `GPLL4` clock in `GCC_SDCC1_APPS_CFG_RCGR` (`(old_cfg & ~0x1fu) | 0x1fu`, i.e. `0x00000205 -> 0x0000021f`, keeping `src_sel = 2`!) and re-issue `CMD6` for 8-bit HS SDR.
+       - Stage 3: `sdhci_switch_to_hs_sdr(false, true)` — switch card (`CMD6` `0x03b70000u` `BUS_WIDTH=0`) and host (`HOST_CONTROL = 0x00`) to 1-bit HS SDR on `DAT0`.
 
 ## SDHCI review fixes applied to the 0142/0143 rewrite (2026-10-22, upstream `c9f7c07`): BOARD_VAL, restore-controller rung 3, synced mock
 

@@ -52,7 +52,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/santoni_sdhci.c
-@@ -0,0 +1,1941 @@
+@@ -0,0 +1,1954 @@
 +/*
 + * SANTONI internal eMMC 5.1 root device (polled SDHCI MSM v4, SDCC1).
 + *
@@ -997,6 +997,9 @@ new file mode 100644
 +	/* Save pre-reset host control, host control 2, timeout control */
 +	handoff_ctrl = hc_rd8(SDHCI_HOST_CONTROL);
 +	handoff_hc2 = hc_rd16(SDHCI_HOST_CONTROL2);
++	if (!(hc_rd(CORE_DLL_CONFIG) & CORE_DLL_EN)) {
++		handoff_hc2 &= ~0x0007u;
++	}
 +	handoff_timeout = hc_rd8(SDHCI_TIMEOUT_CONTROL);
 +	if (handoff_timeout == 0) {
 +		handoff_timeout = SDHCI_TIMEOUT_MAX;
@@ -1051,26 +1054,6 @@ new file mode 100644
 +
 +	/* Route card clock out (DLL or bypass) */
 +	sdhci_clock_output();
-+	if (!(hc_rd(CORE_DLL_CONFIG) & CORE_CK_OUT_EN)) {
-+		if (!se.gcc) {
-+			se.gcc = ml_io_map(0x01842000u, 0x1000u);
-+		}
-+		if (se.gcc) {
-+			uint32_t old_cfg = *(volatile uint32_t *)(se.gcc + 0x08);
-+			if (old_cfg != 0x0000011fu) {
-+				*(volatile uint32_t *)(se.gcc + 0x08) = 0x0000011fu;
-+				*(volatile uint32_t *)(se.gcc + 0x04) |= 0x1u;
-+				for (int i = 0; i < 1000; i++) {
-+					if (!(*(volatile uint32_t *)(se.gcc + 0x04) & 0x1u)) {
-+						break;
-+					}
-+					delay(1);
-+				}
-+				printf("SANTONI SDHCI: GCC CFG_RCGR 0x%08x -> 0x%08x (50 MHz)\n",
-+				    old_cfg, *(volatile uint32_t *)(se.gcc + 0x08));
-+			}
-+		}
-+	}
 +
 +	/*
 +	 * Polled operation: status enable all ones, signal enable zero.
@@ -1311,27 +1294,49 @@ new file mode 100644
 +}
 +
 +static void
-+sdhci_switch_to_hs_sdr(void)
++sdhci_switch_to_hs_sdr(bool lower_gcc, bool bus_1bit)
 +{
 +	uint32_t r1 = 0;
 +
++	if (lower_gcc) {
++		if (!se.gcc) {
++			se.gcc = ml_io_map(0x01842000u, 0x1000u);
++		}
++		if (se.gcc) {
++			uint32_t old_cfg = *(volatile uint32_t *)(se.gcc + 0x08);
++			uint32_t new_cfg = (old_cfg & ~0x1fu) | 0x1fu;
++			if (old_cfg != new_cfg) {
++				*(volatile uint32_t *)(se.gcc + 0x08) = new_cfg;
++				*(volatile uint32_t *)(se.gcc + 0x04) |= 0x1u;
++				for (int i = 0; i < 1000; i++) {
++					if (!(*(volatile uint32_t *)(se.gcc + 0x04) & 0x1u)) {
++						break;
++					}
++					delay(1);
++				}
++				printf("SANTONI SDHCI: GCC CFG_RCGR 0x%08x -> 0x%08x (same PLL /16)\n",
++				    old_cfg, *(volatile uint32_t *)(se.gcc + 0x08));
++			}
++		}
++	}
++
 +	/*
-+	 * LK puts the card to sleep in HS400 (EXT_CSD[185]=3, EXT_CSD[183]=6,
-+	 * 8-bit DDR) and powers down the DLL. Switch the card to High-Speed
-+	 * 8-bit SDR via CMD6 (CMD line is always SDR) and match the host.
++	 * LK puts the card to sleep in HS200/HS400 and powers down the DLL.
++	 * Switch the card to High-Speed SDR via CMD6 (CMD line is always SDR)
++	 * and match the host bus width.
 +	 */
 +	(void)sdhci_cmd(6, 0x03b90100u, 0,
 +	    SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, NULL);
 +	(void)sdhci_reset_paths();
-+	hc_wr16(SDHCI_HOST_CONTROL2, SDHCI_CTRL_VDD_180);
-+	(void)sdhci_pwrctl_ack("IO_1V8", false);
-+	hc_wr8(SDHCI_HOST_CONTROL, SDHCI_CTRL_8BITBUS);
++	hc_wr16(SDHCI_HOST_CONTROL2, se.saved_hc2);
++	hc_wr8(SDHCI_HOST_CONTROL, bus_1bit ? 0u : SDHCI_CTRL_8BITBUS);
 +	(void)sdhci_send_status(se.rca, &r1);
-+	(void)sdhci_cmd(6, 0x03b70200u, 0,
++	(void)sdhci_cmd(6, bus_1bit ? 0x03b70000u : 0x03b70200u, 0,
 +	    SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, NULL);
 +	(void)sdhci_reset_paths();
 +	(void)sdhci_send_status(se.rca, &r1);
-+	printf("SANTONI SDHCI: switched card to 8-bit HS SDR (R1 0x%08x)\n", r1);
++	printf("SANTONI SDHCI: switched card to %s HS SDR (R1 0x%08x)\n",
++	    bus_1bit ? "1-bit" : "8-bit", r1);
 +}
 +
 +static int
@@ -1390,7 +1395,15 @@ new file mode 100644
 +	dma_sync(SDHCI_BLOCK, TRUE);
 +	error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
 +	if (error) {
-+		sdhci_switch_to_hs_sdr();
++		sdhci_switch_to_hs_sdr(false, false);
++		error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
++	}
++	if (error) {
++		sdhci_switch_to_hs_sdr(true, false);
++		error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
++	}
++	if (error) {
++		sdhci_switch_to_hs_sdr(false, true);
 +		error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
 +	}
 +	if (error) {
