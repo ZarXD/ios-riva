@@ -135,7 +135,12 @@
 #define SDHCI_POWER_CONTROL_VAL (SDHCI_POWER_180 | SDHCI_POWER_ON) /* 0x0b */
 
 #define CORE_VENDOR_SPEC       0x10c
-#define CORE_VENDOR_SPEC_POR_VAL (0x00000a9cu | CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH)
+/* POR value of the vendor clock register: MCLK select 2, CORE_CLK_PWRSAVE
+ * off. The I/O pad supply bits are *board* state written by LK, not part of
+ * the reset value - a bare POR write drops them (see 0142). */
+#define CORE_VENDOR_SPEC_POR_VAL 0x00000a9cu
+#define CORE_VENDOR_SPEC_BOARD_VAL (CORE_VENDOR_SPEC_POR_VAL | \
+	CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH)
 #define CORE_HC_MCLK_SEL_MASK  (3u << 8)
 #define CORE_HC_MCLK_SEL_DFLT  (2u << 8)
 #define CORE_HC_SELECT_IN_EN   0x00040000u
@@ -556,8 +561,20 @@ mock_hc_write(uint32_t off, uint32_t val)
 			m.present_state &= ~SDHCI_CMD_INHIBIT;
 		}
 		if (val & SDHCI_RESET_ALL) {
-			/* RESET_ALL clears power and raises BUS_OFF request */
+			/* RESET_ALL clears the whole SDHCI reset domain:
+			 * POWER, CLOCK, HOST_CONTROL, HOST_CONTROL2, TIMEOUT,
+			 * interrupt enables/status. GCC and the vendor window
+			 * (HC_MODE, VENDOR_SPEC, DLL) live outside it and
+			 * survive, exactly like silicon. */
 			mock_hc[SDHCI_POWER_CONTROL] = 0;
+			mock_wr16(SDHCI_CLOCK_CONTROL, 0);
+			mock_hc[SDHCI_HOST_CONTROL] = 0;
+			mock_wr16(SDHCI_HOST_CONTROL2, 0);
+			mock_hc[SDHCI_TIMEOUT_CONTROL] = 0;
+			mock_wr32(SDHCI_INT_ENABLE, 0);
+			mock_wr32(SDHCI_SIGNAL_ENABLE, 0);
+			m.int_status = 0;
+			/* ...and raises a BUS_OFF request. */
 			mock_core[CORE_PWRCTL_STATUS] |= CORE_PWRCTL_BUS_OFF;
 		}
 		mock_hc[off] = 0;       /* reset self-clears when complete */
@@ -733,63 +750,147 @@ sdhci_clock_output(void)
 	}
 }
 
-static void
-sdhci_pwrctl_ack(const char *what)
+/* Hand-off state that survives an SDHCI reset only in our shadow copy. */
+static uint8_t drv_saved_ctrl;
+static uint16_t drv_saved_hc2;
+static uint8_t drv_saved_timeout;
+
+/*
+ * Answer pending CORE_PWRCTL requests. Mirrors sdhci_pwrctl_ack() in 0142:
+ * re-read the pending bits on every retry, ack only the bits actually seen,
+ * and re-assert the pad supply when BUS_ON is acknowledged. `wait` is false
+ * when the caller only clears a stale request.
+ */
+static int
+sdhci_pwrctl_ack(const char *what, bool wait)
 {
 	uint64_t deadline = host_now_ns() + 5000000ull; /* 5 ms */
-	uint32_t ack, status = 0;
+	uint32_t pending, ack;
 	int retry;
 
-	while (host_now_ns() <= deadline) {
-		status = core_rd(CORE_PWRCTL_STATUS) & CORE_PWRCTL_INT_MASK;
-		if (status) {
-			break;
+	if (wait) {
+		for (;;) {
+			pending = core_rd(CORE_PWRCTL_STATUS) &
+			    CORE_PWRCTL_INT_MASK;
+			if (pending || host_now_ns() > deadline) {
+				break;
+			}
+			host_delay_us(1);
 		}
-		host_delay_us(1);
+	} else {
+		pending = core_rd(CORE_PWRCTL_STATUS) & CORE_PWRCTL_INT_MASK;
 	}
-	if (!status) {
-		(void)what;
-		return;
+	if (!pending) {
+		(void)what;     /* status 0 is normal: no state change */
+		return 0;
 	}
 
-	ack = 0;
-	if (status & (CORE_PWRCTL_BUS_ON | CORE_PWRCTL_BUS_OFF)) {
-		ack |= CORE_PWRCTL_BUS_SUCCESS;
-	}
-	if (status & (CORE_PWRCTL_IO_LOW | CORE_PWRCTL_IO_HIGH)) {
-		ack |= CORE_PWRCTL_IO_SUCCESS;
-	}
 	for (retry = 0; retry < 10; retry++) {
-		core_wr(CORE_PWRCTL_CLEAR, status);
-		if (!(core_rd(CORE_PWRCTL_STATUS) & status)) {
-			break;
+		pending = core_rd(CORE_PWRCTL_STATUS) & CORE_PWRCTL_INT_MASK;
+		if (!pending) {
+			return 0;
 		}
+		ack = 0;
+		if (pending & (CORE_PWRCTL_BUS_ON | CORE_PWRCTL_BUS_OFF)) {
+			ack |= CORE_PWRCTL_BUS_SUCCESS;
+		}
+		if (pending & (CORE_PWRCTL_IO_LOW | CORE_PWRCTL_IO_HIGH)) {
+			ack |= CORE_PWRCTL_IO_SUCCESS;
+		}
+		if (pending & CORE_PWRCTL_BUS_ON) {
+			/* VCC is back: the core re-asserts the pad supply,
+			 * it does not rely on a later vendor write. */
+			hc_wr(CORE_VENDOR_SPEC, hc_rd(CORE_VENDOR_SPEC) |
+			    CORE_IO_PAD_PWR_SWITCH_EN |
+			    CORE_IO_PAD_PWR_SWITCH);
+		}
+		core_wr(CORE_PWRCTL_CLEAR, pending);
+		core_wr(CORE_PWRCTL_CTL, ack);
 		host_delay_us(1);
 	}
-	core_wr(CORE_PWRCTL_CTL, ack);
+	(void)what;
+	return ETIMEDOUT;
+}
+
+/* 1.8 V + BUS_ON, never derived from HOST_CONTROL2. See 0142. */
+static int
+sdhci_set_bus_power(void)
+{
+	const uint8_t want = SDHCI_POWER_CONTROL_VAL;
+	uint8_t cur = hc_rd8(SDHCI_POWER_CONTROL);
+
+	if (cur == want) {
+		return sdhci_pwrctl_ack("BUS_ON", false);
+	}
+	if (cur & SDHCI_POWER_ON) {
+		hc_wr8(SDHCI_POWER_CONTROL, 0);
+		(void)sdhci_pwrctl_ack("BUS_OFF", true);
+	}
+	hc_wr8(SDHCI_POWER_CONTROL, want);
+	if (hc_rd8(SDHCI_POWER_CONTROL) != want) {
+		return ENXIO;
+	}
+	return sdhci_pwrctl_ack("BUS_ON", true);
+}
+
+/* MSM SDCC v4 has no internal divider: GCC owns the rate, bits 15:8 stay 0. */
+static int
+sdhci_enable_card_clock(void)
+{
+	uint16_t clk;
+	uint64_t deadline;
+
+	hc_wr16(SDHCI_CLOCK_CONTROL, 0);
+	hc_wr16(SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN);
+
+	deadline = host_now_ns() + 150000000ull;
+	for (;;) {
+		clk = hc_rd16(SDHCI_CLOCK_CONTROL);
+		if (clk & SDHCI_CLOCK_INT_STABLE) {
+			break;
+		}
+		if (host_now_ns() > deadline) {
+			return ETIMEDOUT;
+		}
+		host_delay_us(5);
+	}
+	hc_wr16(SDHCI_CLOCK_CONTROL, (uint16_t)(clk | SDHCI_CLOCK_CARD_EN));
+	clk = hc_rd16(SDHCI_CLOCK_CONTROL);
+	if (!(clk & SDHCI_CLOCK_CARD_EN)) {
+		return ENXIO;
+	}
+	return 0;
 }
 
 /* Take the controller over from the bootloader. */
 static int
 sdhci_take_over(void)
 {
-	uint16_t clk;
-	uint8_t ctrl, to_ctrl;
+	uint16_t handoff_hc2;
+	uint8_t handoff_ctrl, handoff_timeout;
 	uint64_t deadline;
+	int error;
 
 	if (sdhci_core_check() != 0) {
 		return ENXIO;
 	}
 	core_wr(CORE_PWRCTL_MASK, 0);
 
-	/* Vendor clock register before HC mode, Linux's order. */
-	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_POR_VAL);
+	/* Vendor clock and pad supply before HC mode, Linux's order. */
+	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_BOARD_VAL);
 	if (sdhci_enter_hc_mode() != 0) {
 		return ENXIO;
 	}
 
-	sdhci_pwrctl_ack("stale");
-	ctrl = hc_rd8(SDHCI_HOST_CONTROL);
+	(void)sdhci_pwrctl_ack("stale", false);
+
+	/* RESET_ALL will wipe these; they are LK's board state, not ours. */
+	handoff_ctrl = hc_rd8(SDHCI_HOST_CONTROL);
+	handoff_hc2 = hc_rd16(SDHCI_HOST_CONTROL2);
+	handoff_timeout = hc_rd8(SDHCI_TIMEOUT_CONTROL);
+	if (handoff_timeout == 0) {
+		handoff_timeout = 0x0eu;
+	}
 
 	hc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
 	deadline = host_now_ns() + 100000000ull;
@@ -799,35 +900,25 @@ sdhci_take_over(void)
 		}
 		host_delay_us(5);
 	}
-	sdhci_pwrctl_ack("BUS_OFF");
+	(void)sdhci_pwrctl_ack("BUS_OFF", true);
 
 	sdhci_select_hc_clock();
+	hc_wr8(SDHCI_HOST_CONTROL,
+	    (uint8_t)(handoff_ctrl & ~SDHCI_CTRL_DMA_MASK));
+	hc_wr16(SDHCI_HOST_CONTROL2, handoff_hc2);
+	hc_wr8(SDHCI_TIMEOUT_CONTROL, handoff_timeout);
+	drv_saved_ctrl = handoff_ctrl;
+	drv_saved_hc2 = handoff_hc2;
+	drv_saved_timeout = handoff_timeout;
 
-	hc_wr8(SDHCI_POWER_CONTROL, SDHCI_POWER_CONTROL_VAL);
-	sdhci_pwrctl_ack("BUS_ON");
-
-	hc_wr16(SDHCI_CLOCK_CONTROL, 0);
-	hc_wr16(SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN);
-	deadline = host_now_ns() + 150000000ull;
-	while (!(hc_rd16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE)) {
-		if (host_now_ns() > deadline) {
-			return ENXIO;
-		}
-		host_delay_us(5);
-	}
-	hc_wr16(SDHCI_CLOCK_CONTROL,
-	    SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE | SDHCI_CLOCK_CARD_EN);
-	clk = hc_rd16(SDHCI_CLOCK_CONTROL);
-	if (!(clk & SDHCI_CLOCK_CARD_EN)) {
+	if (sdhci_set_bus_power() != 0) {
 		return ENXIO;
 	}
-	sdhci_clock_output();
-
-	hc_wr8(SDHCI_HOST_CONTROL, (uint8_t)(ctrl & ~SDHCI_CTRL_DMA_MASK));
-	to_ctrl = hc_rd8(SDHCI_TIMEOUT_CONTROL);
-	if (to_ctrl == 0) {
-		hc_wr8(SDHCI_TIMEOUT_CONTROL, 0x0eu);
+	error = sdhci_enable_card_clock();
+	if (error) {
+		return error;
 	}
+	sdhci_clock_output();
 
 	/* Polled operation: status enabled, interrupt signal not routed. */
 	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
@@ -1004,6 +1095,35 @@ sdhci_recover(void)
 	return 0;
 }
 
+/*
+ * Rebuild everything an SDHCI reset wipes. Mirrors sdhci_restore_controller()
+ * in 0142: BOARD_VAL (pads included, never bare POR), pad supply on BUS_ON,
+ * saved HOST_CONTROL/HOST_CONTROL2/TIMEOUT, power, interrupts, clock.
+ */
+static int
+sdhci_restore_controller(void)
+{
+	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_BOARD_VAL);
+	sdhci_select_hc_clock();
+	hc_wr8(SDHCI_HOST_CONTROL,
+	    (uint8_t)(drv_saved_ctrl & ~SDHCI_CTRL_DMA_MASK));
+	hc_wr16(SDHCI_HOST_CONTROL2, drv_saved_hc2);
+	hc_wr8(SDHCI_TIMEOUT_CONTROL,
+	    drv_saved_timeout ? drv_saved_timeout : 0x0eu);
+
+	if (sdhci_set_bus_power() != 0) {
+		return ENXIO;
+	}
+	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
+	hc_wr(SDHCI_SIGNAL_ENABLE, 0);
+	hc_wr(SDHCI_INT_STATUS, hc_rd(SDHCI_INT_STATUS));
+	if (sdhci_enable_card_clock() != 0) {
+		return ENXIO;
+	}
+	sdhci_clock_output();
+	return sdhci_reset_paths();
+}
+
 /* ------------------------------------------------ RCA ladder (driver logic) */
 
 static uint32_t drv_rca;
@@ -1079,10 +1199,9 @@ sdhci_claim_card(void)
 		return sdhci_restore_state(&r1);
 	}
 
-	/* Rung 3: Linux sdhci_msm_probe() resets HC + 0x10c to POR. */
-	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_POR_VAL);
-	(void)sdhci_reset_paths();
-	if (sdhci_send_status(SANTONI_CARD_RCA, &r1) == 0) {
+	/* Rung 3: a core self-reset wiped the SDHCI reset domain. */
+	if (sdhci_restore_controller() == 0 &&
+	    sdhci_send_status(SANTONI_CARD_RCA, &r1) == 0) {
 		drv_rca = SANTONI_CARD_RCA;
 		return sdhci_restore_state(&r1);
 	}
@@ -1217,6 +1336,11 @@ reset_mock(void)
 	mock_wr16(SDHCI_CLOCK_CONTROL,
 	    SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE | SDHCI_CLOCK_CARD_EN);
 	mock_hc[SDHCI_HOST_CONTROL] = SDHCI_CTRL_8BITBUS | SDHCI_CTRL_DMA_MASK;
+	/* Board state RESET_ALL must not eat: LK runs the eMMC at 1.8 V I/O
+	 * and picked its own timeout. Both are non-default on purpose so a
+	 * lost restore is visible. */
+	mock_wr16(SDHCI_HOST_CONTROL2, SDHCI_CTRL_VDD_180);
+	mock_hc[SDHCI_TIMEOUT_CONTROL] = 0x08;
 
 	for (uint32_t b = 0; b < MOCK_CARD_BLOCKS; b++) {
 		for (uint32_t i = 0; i < SDHCI_BLOCK; i++) {
@@ -1278,6 +1402,12 @@ test_registers(void)
 	assert((CORE_VENDOR_SPEC_POR_VAL & CORE_HC_MCLK_SEL_MASK) ==
 	    CORE_HC_MCLK_SEL_DFLT);
 	assert((CORE_VENDOR_SPEC_POR_VAL & CORE_HC_SELECT_IN_EN) == 0);
+	/* The POR value has no pad supply; the board value adds LK's bits. */
+	assert(CORE_VENDOR_SPEC_POR_VAL == 0x00000a9cu);
+	assert(CORE_VENDOR_SPEC_BOARD_VAL == 0x00018a9cu);
+	assert((CORE_VENDOR_SPEC_BOARD_VAL &
+	    (CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH)) ==
+	    (CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH));
 
 	/* One 0x1000 MMIO window maps core + HC (0x900) including its 0x500 */
 	assert(SDHCI_HC_OFFSET == 0x900);
@@ -1321,18 +1451,21 @@ test_take_over(void)
 	assert(hc_rd(SDHCI_INT_STATUS) == 0);
 	assert(hc_rd16(SDHCI_BLOCK_SIZE) == 0);
 
-	/* The vendor clock register is at its POR value before HC mode is
-	 * enabled, and free-running MCLK is selected for the HC datapath. */
-	assert(hc_rd(CORE_VENDOR_SPEC) == CORE_VENDOR_SPEC_POR_VAL);
+	/* LK's pad supply is board state, not the reset value: the vendor
+	 * register must end at BOARD_VAL, and free-running MCLK is selected. */
+	assert(hc_rd(CORE_VENDOR_SPEC) == CORE_VENDOR_SPEC_BOARD_VAL);
 	assert((hc_rd(CORE_VENDOR_SPEC) & CORE_HC_MCLK_SEL_MASK) ==
 	    CORE_HC_MCLK_SEL_DFLT);
 	assert((hc_rd(CORE_VENDOR_SPEC) & CORE_HC_SELECT_IN_EN) == 0);
+	/* HOST_CONTROL2 and TIMEOUT_CONTROL were saved across RESET_ALL. */
+	assert(hc_rd16(SDHCI_HOST_CONTROL2) == SDHCI_CTRL_VDD_180);
+	assert(hc_rd8(SDHCI_TIMEOUT_CONTROL) == 0x08);
 	assert(mock_hc_clocked());
 
 	/* Dead GCC card clock: fail closed, RAM-disk boot survives. */
 	reset_mock();
 	m.clock_stalled = 1;
-	assert(sdhci_take_over() == ENXIO);
+	assert(sdhci_take_over() == ETIMEDOUT);
 
 	/* An unclocked vendor core is not ours. */
 	reset_mock();
@@ -1349,6 +1482,56 @@ test_take_over(void)
 	reset_mock();
 	m.hc_mode_write_ignored = 1;
 	assert(sdhci_take_over() == 0);
+}
+
+/*
+ * Rung 3: a core self-reset (FF_CLK_SW_RST_DIS not sticking) wipes every
+ * register in the SDHCI reset domain. The restore must bring power, clock,
+ * HOST_CONTROL2 and TIMEOUT back from the shadow copy, keep LK's pad supply,
+ * and must not cut VCC or change the card's RCA.
+ */
+static void
+test_rung3_self_reset(void)
+{
+	uint32_t r1 = 0;
+	int error;
+
+	reset_mock();
+	assert(sdhci_take_over() == 0);
+	assert(drv_saved_hc2 == SDHCI_CTRL_VDD_180);
+	assert(drv_saved_timeout == 0x08);
+
+	/* Model the self-reset: reset domain gone, vendor window lost. */
+	mock_hc[SDHCI_POWER_CONTROL] = 0;
+	mock_wr16(SDHCI_CLOCK_CONTROL, 0);
+	mock_hc[SDHCI_HOST_CONTROL] = 0;
+	mock_wr16(SDHCI_HOST_CONTROL2, 0);
+	mock_hc[SDHCI_TIMEOUT_CONTROL] = 0;
+	mock_wr32(SDHCI_INT_ENABLE, 0);
+	hc_wr(CORE_VENDOR_SPEC, 0);
+	assert(hc_rd8(SDHCI_POWER_CONTROL) == 0);
+
+	/* Rungs 1 and 2 find a dead command path; rung 3 must recover. */
+	error = sdhci_claim_card();
+	assert(error == 0);
+	assert(drv_rca == SANTONI_CARD_RCA);
+	assert(hc_rd8(SDHCI_POWER_CONTROL) == SDHCI_POWER_CONTROL_VAL);
+	assert(hc_rd16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_CARD_EN);
+	assert(hc_rd16(SDHCI_HOST_CONTROL2) == SDHCI_CTRL_VDD_180);
+	assert(hc_rd8(SDHCI_TIMEOUT_CONTROL) == 0x08);
+	assert(hc_rd(CORE_VENDOR_SPEC) == CORE_VENDOR_SPEC_BOARD_VAL);
+	assert(mock_hc_clocked());
+
+	/* The card was never power-cycled: CMD13 still answers on LK's RCA. */
+	assert(sdhci_send_status(SANTONI_CARD_RCA, &r1) == 0);
+	assert(((r1 >> 9) & 0xf) == 4);
+
+	/* Restoring a live core is idempotent and must not clear the pads -
+	 * the failure mode where rung 3 wrote the bare POR value. */
+	assert(sdhci_restore_controller() == 0);
+	assert(hc_rd(CORE_VENDOR_SPEC) == CORE_VENDOR_SPEC_BOARD_VAL);
+	assert(hc_rd8(SDHCI_POWER_CONTROL) == SDHCI_POWER_CONTROL_VAL);
+	assert(core_rd(CORE_PWRCTL_CTL) == CORE_PWRCTL_BUS_SUCCESS);
 }
 
 static void
@@ -1565,7 +1748,7 @@ test_card_ladder(void)
 	assert(sdhci_claim_card() == 0);
 	assert(drv_rca == SANTONI_CARD_RCA);
 	assert(m.card_asleep == 0);
-	assert(hc_rd(CORE_VENDOR_SPEC) == CORE_VENDOR_SPEC_POR_VAL);
+	assert(hc_rd(CORE_VENDOR_SPEC) == CORE_VENDOR_SPEC_BOARD_VAL);
 	saw_cmd5 = 0;
 	for (unsigned i = 0; i < m.cmd_count; i++) {
 		if (m.trace[i].cmd == 5) {
@@ -1742,6 +1925,7 @@ main(void)
 {
 	test_registers();
 	test_take_over();
+	test_rung3_self_reset();
 	test_clock_path();
 	test_cmd13_status();
 	test_cid_csd();

@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 --- a/bsd/dev/santoni_sdhci.c
 +++ b/bsd/dev/santoni_sdhci.c
-@@ -47,6 +47,10 @@
+@@ -54,6 +54,10 @@
  #include <pexpert/pexpert.h>
  #include <pexpert/device_tree.h>
  #include <libkern/libkern.h>
@@ -12,7 +12,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
-@@ -1076,7 +1080,136 @@
+@@ -1897,7 +1901,133 @@
  	    se.part, (unsigned long long)se.first_block,
  	    (unsigned long long)(se.nblocks * SDHCI_BLOCK >> 20),
  	    se.writable ? "writable (emmcrw=1)" : "read-only");
@@ -76,7 +76,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 +{
 +	uint64_t base = se.sys_first_block;
 +	uint64_t flushed = 0, seq = 0;
-+	char *bounce = (char *)(se.dma + DMA_BOUNCE);
++	uint8_t bounce[SDHCI_BLOCK];
 +
 +	printf("SANTONI LOG: console log flusher active on SYSTEM partition "
 +	    "(block 0x%llx..0x%llx, %u KiB)\n",
@@ -103,11 +103,8 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 +			    (uint64_t)(SANTONI_LOG_SIZE / SDHCI_BLOCK - blk)),
 +			    (uint64_t)(BOUNCE_SIZE / SDHCI_BLOCK));
 +
-+			memcpy(bounce,
-+			    santoni_log_ring + (uint64_t)blk * SDHCI_BLOCK,
-+			    (size_t)n * SDHCI_BLOCK);
 +			error = santoni_sdhci_write_log_blocks(base + 1 + blk,
-+			    n, bounce);
++			    n, santoni_log_ring + (uint64_t)blk * SDHCI_BLOCK);
 +			pos += (uint64_t)(blk + n) * SDHCI_BLOCK - off;
 +		}
 +		if (!error) {
@@ -139,7 +136,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 +	thread_t thread;
 +
 +	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
-+	if (!on || se.sys_nblocks < SANTONI_LOG_BLOCKS) {
++	if (!on || !se.log_ok) {
 +		return;
 +	}
 +	if (kernel_thread_start(santoni_log_thread, NULL, &thread) ==
