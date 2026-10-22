@@ -76,6 +76,8 @@ _start:
 	mov	x20, x0			/* fd */
 
 	sub	sp, sp, #544		/* [0..511] read buf, [512..535] hex */
+	stp	xzr, xzr, [sp]
+	stp	xzr, xzr, [sp, #512]
 	mov	x0, x20
 	mov	x1, sp
 	mov	x2, #512

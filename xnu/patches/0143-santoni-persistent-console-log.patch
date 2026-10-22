@@ -12,7 +12,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
-@@ -1923,7 +1927,133 @@
+@@ -1937,7 +1941,133 @@
  	    se.part, (unsigned long long)se.first_block,
  	    (unsigned long long)(se.nblocks * SDHCI_BLOCK >> 20),
  	    se.writable ? "writable (emmcrw=1)" : "read-only");

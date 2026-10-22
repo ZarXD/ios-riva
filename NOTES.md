@@ -68,9 +68,31 @@
       3. `CMD8` (`SEND_EXT_CSD`) read all 512 bytes over the 8-bit data bus and decoded `30,535,680` sectors (**14,910 MiB**).
       4. `santoni_sdhci_read_blocks(1, 1, b)` **succeeded**, read **LBA 1 (the Primary GPT Header `"EFI PART"`)**, verified its **IEEE 802.3 CRC32**, and extracted `hdr.partition_entry_lba = 2` (`0x00000002`).
       5. **Why `LBA 2` (`command 18`, `arg 0x00000002`) failed with `PRESENT_STATE 0x01080207`:** `LBA 1` (`count = 1`) was read using `CMD18` (`READ_MULTIPLE_BLOCK`) without `CMD17`, `CMD23` (`SET_BLOCK_COUNT`), or `CMD12` (`STOP_TRANSMISSION`). Per JEDEC eMMC 5.1 (JESD84-B51 6.6.17), `SDHCI_BLOCK_COUNT` is a host-only register; an eMMC chip given `CMD18` without `CMD23` keeps streaming blocks indefinitely in `DATA` state (`PRESENT_STATE 0x01080207` = `READ_TRANSFER_ACTIVE | DAT_ACTIVE | DATA_INHIBIT`).
-  - **Boot 6 Fix:**
-    1. Call `sdhci_switch_to_hs_sdr(true, false)` directly before `CMD8` so there are zero noisy 384 MHz errors.
-    2. In `sdhci_read_pio()`, use single-block `CMD17` (`READ_SINGLE_BLOCK`) when `index == 18 && count == 1`, and precede multi-block `CMD18` (`count > 1`) and `CMD25` (`sdhci_write_pio()`) with `CMD23` (`SET_BLOCK_COUNT`, `arg = count`) so the Samsung eMMC chip terminates every multi-block transfer after `count` blocks and returns cleanly to `TRAN` (`state 4`).
+  - **Boot 6 on Physical Redmi 5A (`riva`) (`shim-boot.img` SHA256 `e7712639...`, commit `a22396d`, `Screenshot 2026-10-22 150835.png`):**
+    - **MAJOR MILESTONE — FULL eMMC 5.1 + GPT PARTITION PROBE (`"system"` & `"userdata"`), `/dev/emmcroot0` REGISTRATION, AND USERSPACE `/dev/remmcroot0` SECTOR READ SUCCEEDED ON HARDWARE!**
+    - Exact hardware console lines from `Screenshot 2026-10-22 150835.png`:
+      ```text
+      SANTONI SDHCI: CMD5 awake RCA 2 -> R1 0x000015b0
+      SANTONI SDHCI: CMD13 after wake-up (R1 0x00000700, state 3)
+      SANTONI SDHCI: card state 3 (not TRAN), R1 0x00000700
+      SANTONI SDHCI: selecting RCA 2 (CMD7)
+      SANTONI SDHCI: eMMC MID 0x15 CBX 0x01 OID 0x00 PNM "QE63MB" rev 0.3 S/N 0x3c5d9bca MDT 0xb4 CSD 0xd0270132
+      SANTONI SDHCI: GCC CFG_RCGR 0x00000205 -> 0x0000021f (same PLL /16)
+      SANTONI SDHCI: switched card to 8-bit HS SDR (R1 0x00000900)
+      SANTONI SDHCI: eMMC 5.1, 14910 MiB (30535680 x 512-byte sectors)
+      SANTONI SDHCI: "system" first block 0x101000, 3072 MiB (console log area available)
+      SANTONI SDHCI: "userdata" first block 0x960000, 10109 MiB, read-only
+      BSD root: md0, major 1, minor 0
+      ...
+      *** RIVA userspace: init running as PID 1 ***
+      ```
+    - **What happened after `*** RIVA userspace: init running as PID 1 ***`:**
+      - PID 1 (`tools/santoni-init.S`) opened `/dev/remmcroot0` (`SYS_open` succeeded!) and called `SYS_read(fd, sp, 512)` to read LBA 0 of `userdata` (`0x960000`).
+      - `santoni_sdhci_strategy()` read sector `0x960000` from the Samsung eMMC into `bounce` (`0xfffffffb1f5e6000`) — and the first 64 bytes of `userdata` are visible right in the CPU registers (`x8 = 0x6b75043807bebe00`, `x9 = 0x7507fefe8110c603`, ..., `x15 = 0x000621eaa4f30200`)!
+      - Then `memcpy(vaddr + done, bounce + skip, want)` faulted at `x0 = 0x000000016fdffbe0` (`esr = 0x9600004f`, Level 3 Permission Fault on Write) because `physio()` on a character device (`/dev/remmcroot0`) leaves `bp->b_datap` (`vaddr`) as a raw `TTBR0` userspace virtual address (`< 0xffffff0000000000ULL`), and in XNU on ARM64 only `copyout()` / `copyin()` are listed in `copyio_recover_table` (`COPYIO_RECOVER_RANGE`) so `sleh.c` can invoke `vm_fault()` on an unfaulted user stack page.
+  - **Boot 7 Fix:**
+    1. In `santoni_sdhci_strategy()`, use `copyout()` / `copyin()` whenever `(uintptr_t)vaddr < 0xffffff0000000000ULL` (character device `physio` with a userspace `TTBR0` address) and `memcpy()` for kernel addresses (`>= 0xffffff0000000000ULL`, block device buffer cache).
+    2. In `tools/santoni-init.S`, also pre-touch `[sp]` and `[sp, #512]` after `sub sp, sp, #544`.
 
 ## SDHCI review fixes applied to the 0142/0143 rewrite (2026-10-22, upstream `c9f7c07`): BOARD_VAL, restore-controller rung 3, synced mock
 

@@ -52,7 +52,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/santoni_sdhci.c
-@@ -0,0 +1,1967 @@
+@@ -0,0 +1,1981 @@
 +/*
 + * SANTONI internal eMMC 5.1 root device (polled SDHCI MSM v4, SDCC1).
 + *
@@ -1761,7 +1761,13 @@ new file mode 100644
 +			error = santoni_sdhci_read_blocks(se.first_block + lba,
 +			    blocks, bounce);
 +			if (!error) {
-+				memcpy(vaddr + done, bounce + skip, want);
++				if ((uintptr_t)vaddr < 0xffffff0000000000ULL) {
++					error = copyout(bounce + skip,
++					    (user_addr_t)(uintptr_t)(vaddr + done),
++					    want);
++				} else {
++					memcpy(vaddr + done, bounce + skip, want);
++				}
 +			}
 +		} else {
 +			if (skip || (want % SDHCI_BLOCK)) {
@@ -1769,9 +1775,17 @@ new file mode 100644
 +				    blocks, bounce);
 +			}
 +			if (!error) {
-+				memcpy(bounce + skip, vaddr + done, want);
-+				error = santoni_sdhci_write_blocks(
-+				    se.first_block + lba, blocks, bounce);
++				if ((uintptr_t)vaddr < 0xffffff0000000000ULL) {
++					error = copyin(
++					    (user_addr_t)(uintptr_t)(vaddr + done),
++					    bounce + skip, want);
++				} else {
++					memcpy(bounce + skip, vaddr + done, want);
++				}
++				if (!error) {
++					error = santoni_sdhci_write_blocks(
++					    se.first_block + lba, blocks, bounce);
++				}
 +			}
 +		}
 +		if (error) {
