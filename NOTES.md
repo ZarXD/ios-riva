@@ -1,6 +1,76 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## SDHCI Qualcomm MSM v4 MMIO register routing fix (2026-10-22, latest): HC vs Core window split
+## SDHCI vendor window fix confirmed, CMD0 still inhibited (2026-10-22, latest): missing power + reset-all
+
+- **Hardware observation (Redmi 4X, boot of the image built from `c52abc4`/`077816f`):**
+  - `CORE_VENDOR_SPEC` at `0x07824a0c` now reads the *real* LK value
+    `0x00358b1c` (the previous builds read `0x00000000` from the wrong
+    `core+0x10c` window), and the POR write `0xa9c` reads back `0xa9c` at that
+    same address. **The HC-vs-core MMIO split fix is confirmed.**
+  - `CORE_HC_MODE` write `0x2001` reads back `0x00000001`: bit 13 reads 0.
+  - `CLOCK_CONTROL 0x0003 -> 0x0007` (INT_EN|INT_STABLE -> +CARD_EN) latches.
+  - `POWER_CONTROL` reads **`0x00`** (the `df4395e` boot read `0x0B`).
+  - `PRESENT_STATE 0x01f80000` (card present/stable/detect/WP, DAT[3:0] and
+    CMD line high = idle). After CMD0: `0x01f80001`, `INT_STATUS 0x00000000`.
+    CMD line level (bit 24) is still high: the 48-bit frame never began to
+    shift. No CC and no error bit at all = the command shifter has no SDCLK.
+- **Decode of LK's `0x00358b1c`** (verified bit by bit) = LK POR `0xa1c`
+  (MCLK sel 2) with MCLK sel flipped to 3 (`3<<8`), `PAD_PWR_SWITCH_EN`
+  (`1<<15`), `PAD_PWR_SWITCH` (`1<<16`), `HC_SELECT_IN_EN` (`1<<18`) and
+  `HC_SELECT_IN_HS400` (`6<<19`). LK left the HC clock mux in **HS400** while
+  `CORE_DLL_CONFIG 0x6000642c` has DLL_EN=0, PDN=1, RST=1, CK_OUT_EN=0: a dead
+  SDCLK path. That explains the earlier `0x0B`-power boot's hang (different
+  cause, same symptom), so power alone was never the first blocker.
+- **Three deviations from LK/Linux, all present in the current driver:**
+  1. **`POWER_CONTROL` is never written** (`0x00`). LK
+     `sdhci_set_bus_power_on()` writes `0x0B` (1.8V + bus power) and waits for
+     the CORE_PWRCTL ack; Linux does it from `sdhci_set_power()` in
+     `sdhci_set_ios()`. The SDHCI power-up order is power first, then card
+     clock - the driver does the opposite (opens CARD_EN with power off).
+  2. **No RESET_ALL after `HC_MODE_EN`.** LK `sdhci_msm_init()` does
+     `VENDOR_SPEC <- 0xA1C`, `HC_MODE_EN`, `FF_CLK_SW_RST_DIS`, then
+     `sdhci_reset(SOFT_RESET_ALL)`. Linux does `sdhci_add_host()` ->
+     `sdhci_init(0)` -> reset ALL. The 0142 header claim that RESET_ALL "would
+     wipe the clock programming the bootloader did through GCC" is wrong: GCC
+     is outside the SDHCI reset domain; RESET_ALL clears POWER/CLOCK/
+     HOST_CONTROL/INT, which LK and Linux then reprogram.
+  3. **`0xa9c` clears LK's pad power bits.** `IO_PAD_PWR_SWITCH_EN` (`1<<15`)
+     and `IO_PAD_PWR_SWITCH` (`1<<16`) are re-set by Linux
+     (`sdhci_msm_set_regulator_caps()`) and by LK (`use_io_switch`). Correct
+     value on this board is **`0x18a9c`** (POR + pad switch EN + 1.8V select);
+     `0x00358b1c` proves LK wanted both bits.
+  4. The gate reopen starts from `CLOCK_CONTROL 0x0003` without writing 0 and
+     re-proving INT_STABLE. LK writes 0, then INT_EN, polls STABLE, then
+     CARD_EN; a stale bit 1 cannot distinguish a live MCLK from a dead one.
+- **FF_CLK_SW_RST_DIS verdict:** bit 13 is correctly defined (Linux
+  `BIT(13)`, LK `START 0xD/WIDTH 1`). Neither LK nor Linux ever reads it back,
+  and bit 0 latches through the same write path, so a 0 readback is not
+  evidence that the write was dropped (write-only/shadowed bit). Do not branch
+  on it; keep the separate write after `HC_MODE_EN`.
+- **Power values (SDHCI 3.0):** `0x0B` = 1.8V + bus on, `0x0D` = 3.0V + on,
+  `0x0F` = 3.3V + on. Use `0x0B` here: LK used it and the pad switch is set
+  for 1.8V. A POWER_CONTROL write raises the CORE_PWRCTL request; ack it via
+  `core+0xdc/0xe0/0xe4/0xe8` (status/clear/ctl, BUS_ON=0x2 -> BUS_SUCCESS=0x1,
+  IO_HIGH=0x8 -> IO_SUCCESS=0x4). `CORE_GENERICS 0x24100041` has
+  SWITCHABLE_SIGNALING_VOLTAGE (`BIT(29)`) set, so HOST_CONTROL2 1.8V changes
+  also generate a PWRCTL request.
+- **Implemented driver fix (committed in this change):**
+  Takeover implementation updated with full consensus from DeepSeek v4.1:
+  1. `VENDOR_SPEC` written with `0x18a9c` (`CORE_VENDOR_SPEC_POR_VAL | CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH`) to preserve 1.8V pad switches.
+  2. `HC_MODE_EN` and `FF_CLK_SW_RST_DIS` applied in Linux order.
+  3. Pre-reset `HOST_CONTROL` saved, then full `SDHCI_RESET_ALL` issued.
+  4. Handled `sdhci_pwrctl_ack("BUS_OFF")` for reset power drop.
+  5. Asserted `sdhci_select_hc_clock()`.
+  6. Wrote `SDHCI_POWER_CONTROL = 0x0B` (1.8V + bus on) and handled `sdhci_pwrctl_ack("BUS_ON")`.
+  7. Re-proved clock: written 0, `INT_EN`, polled `INT_STABLE` with 150 ms timeout, latched `CARD_EN`, routed clock output.
+  8. Restored bus width, enabled status interrupts for polled loop.
+  9. Fenced `santoni_sdhci_write_log_blocks()` to disallow writes when `se.first_block == se.sys_first_block` (WR-01).
+  10. Updated `test_sdhci_mock.c` with accurate `RESET_ALL`, `POWER_CONTROL`, and `PWRCTL` state machines; all host tests and patch checks passing.
+- **Artifact state:** unchanged; last boot image is still
+  `shim/out/shim-boot.img` 16,934,912 B SHA256
+  `2d759c468ad79c4a4769a373b8d5a7bc0196a88dd4e0bb85401f2469ce7467e5`.
+
+## SDHCI Qualcomm MSM v4 MMIO register routing fix (2026-10-22, previous): HC vs Core window split
 
 - **Hardware observation (photo `20261022_012915.jpg`, Redmi 4X, commit `e8552c0`):**
   Takeover succeeded and logged `CORE_VENDOR_SPEC 0x00000000 (MCLK sel 0) -> POR 0x00000a9c`,

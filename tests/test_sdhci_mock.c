@@ -113,8 +113,29 @@
 #define CORE_FF_CLK_SW_RST_DIS 0x00002000u
 #define CORE_PWRCTL_STATUS     0xdc
 #define CORE_PWRCTL_MASK       0xe0
+#define CORE_PWRCTL_CLEAR      0xe4
+#define CORE_PWRCTL_CTL        0xe8
+#define CORE_PWRCTL_BUS_OFF    0x00000001u
+#define CORE_PWRCTL_BUS_ON     0x00000002u
+#define CORE_PWRCTL_IO_LOW     0x00000004u
+#define CORE_PWRCTL_IO_HIGH    0x00000008u
+#define CORE_PWRCTL_INT_MASK   0x0000000fu
+#define CORE_PWRCTL_BUS_SUCCESS 0x00000001u
+#define CORE_PWRCTL_IO_SUCCESS 0x00000004u
+#define CORE_IO_PAD_PWR_SWITCH_EN 0x00008000u    /* BIT(15) */
+#define CORE_IO_PAD_PWR_SWITCH 0x00010000u    /* BIT(16) */
+
+#define SDHCI_POWER_CONTROL    0x29
+#define SDHCI_TIMEOUT_CONTROL  0x2e
+#define SDHCI_HOST_CONTROL2    0x3e
+#define SDHCI_CTRL_4BITBUS     0x02u
+#define SDHCI_CTRL_VDD_180     0x0008u
+#define SDHCI_POWER_ON         0x01u
+#define SDHCI_POWER_180        0x0au
+#define SDHCI_POWER_CONTROL_VAL (SDHCI_POWER_180 | SDHCI_POWER_ON) /* 0x0b */
+
 #define CORE_VENDOR_SPEC       0x10c
-#define CORE_VENDOR_SPEC_POR_VAL 0xa9cu
+#define CORE_VENDOR_SPEC_POR_VAL (0x00000a9cu | CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH)
 #define CORE_HC_MCLK_SEL_MASK  (3u << 8)
 #define CORE_HC_MCLK_SEL_DFLT  (2u << 8)
 #define CORE_HC_SELECT_IN_EN   0x00040000u
@@ -179,6 +200,7 @@ static struct mock {
 	int stall_cmd;
 	int fail_cmd;
 	int fail_data;
+	int clock_stalled;
 	unsigned state_reads;
 	unsigned clock_writes;
 	unsigned reset_writes;
@@ -383,12 +405,12 @@ mock_command(uint16_t val)
 	m.cmd_count++;
 
 	/*
-	 * No functional clock: the 48 bits never leave the shifter, the
+	 * No functional clock or bus power off: the 48 bits never leave the shifter, the
 	 * controller keeps CMD_INHIBIT asserted and never posts Command
-	 * Complete - the card being absent or powered off is irrelevant here,
+	 * Complete - the card being absent is irrelevant here,
 	 * CMD0 behaves the same.
 	 */
-	if (!mock_hc_clocked()) {
+	if (!mock_hc_clocked() || !(mock_hc[SDHCI_POWER_CONTROL] & SDHCI_POWER_ON)) {
 		m.present_state |= SDHCI_CMD_INHIBIT;
 		return;
 	}
@@ -530,14 +552,31 @@ mock_hc_write(uint32_t off, uint32_t val)
 		m.reset_writes++;
 		m.reset_value = (uint16_t)val;
 		/* A command-path reset releases a stuck CMD_INHIBIT. */
-		if (val & SDHCI_RESET_CMD) {
+		if (val & (SDHCI_RESET_CMD | SDHCI_RESET_ALL)) {
 			m.present_state &= ~SDHCI_CMD_INHIBIT;
+		}
+		if (val & SDHCI_RESET_ALL) {
+			/* RESET_ALL clears power and raises BUS_OFF request */
+			mock_hc[SDHCI_POWER_CONTROL] = 0;
+			mock_core[CORE_PWRCTL_STATUS] |= CORE_PWRCTL_BUS_OFF;
 		}
 		mock_hc[off] = 0;       /* reset self-clears when complete */
 		break;
+	case SDHCI_POWER_CONTROL:
+		mock_hc[off] = (uint8_t)val;
+		if (val & SDHCI_POWER_ON) {
+			mock_core[CORE_PWRCTL_STATUS] |= CORE_PWRCTL_BUS_ON;
+		}
+		break;
 	case SDHCI_CLOCK_CONTROL:
 		m.clock_writes++;       /* the default hand-off must need none */
-		mock_wr16(off, (uint16_t)val);
+		if (m.clock_stalled) {
+			mock_wr16(off, (uint16_t)val);
+		} else if (val & SDHCI_CLOCK_INT_EN) {
+			mock_wr16(off, (uint16_t)(val | SDHCI_CLOCK_INT_STABLE));
+		} else {
+			mock_wr16(off, (uint16_t)val);
+		}
 		break;
 	default:
 		mock_wr32(off, val);
@@ -580,7 +619,17 @@ hc_rd8(uint32_t off)
 static inline void
 hc_wr8(uint32_t off, uint8_t val)
 {
-	mock_hc_write(off, val);
+	if (off == SDHCI_SOFTWARE_RESET || off == SDHCI_POWER_CONTROL ||
+	    off == SDHCI_TIMEOUT_CONTROL || off == SDHCI_HOST_CONTROL) {
+		mock_hc[off] = val;
+		if (off == SDHCI_SOFTWARE_RESET) {
+			mock_hc_write(off, val);
+		} else if (off == SDHCI_POWER_CONTROL) {
+			mock_hc_write(off, val);
+		}
+		return;
+	}
+	mock_hc[off] = val;
 }
 
 static inline uint32_t
@@ -595,6 +644,18 @@ static inline void
 core_wr(uint32_t off, uint32_t val)
 {
 	if (off == CORE_HC_MODE && m.hc_mode_write_ignored) {
+		return;
+	}
+	if (off == CORE_PWRCTL_CLEAR) {
+		uint32_t cur = (uint32_t)mock_core[CORE_PWRCTL_STATUS] |
+		    ((uint32_t)mock_core[CORE_PWRCTL_STATUS + 1] << 8) |
+		    ((uint32_t)mock_core[CORE_PWRCTL_STATUS + 2] << 16) |
+		    ((uint32_t)mock_core[CORE_PWRCTL_STATUS + 3] << 24);
+		cur &= ~val;
+		mock_core[CORE_PWRCTL_STATUS] = (uint8_t)cur;
+		mock_core[CORE_PWRCTL_STATUS + 1] = (uint8_t)(cur >> 8);
+		mock_core[CORE_PWRCTL_STATUS + 2] = (uint8_t)(cur >> 16);
+		mock_core[CORE_PWRCTL_STATUS + 3] = (uint8_t)(cur >> 24);
 		return;
 	}
 	mock_core[off] = (uint8_t)val;
@@ -672,53 +733,107 @@ sdhci_clock_output(void)
 	}
 }
 
+static void
+sdhci_pwrctl_ack(const char *what)
+{
+	uint64_t deadline = host_now_ns() + 5000000ull; /* 5 ms */
+	uint32_t ack, status = 0;
+	int retry;
+
+	while (host_now_ns() <= deadline) {
+		status = core_rd(CORE_PWRCTL_STATUS) & CORE_PWRCTL_INT_MASK;
+		if (status) {
+			break;
+		}
+		host_delay_us(1);
+	}
+	if (!status) {
+		(void)what;
+		return;
+	}
+
+	ack = 0;
+	if (status & (CORE_PWRCTL_BUS_ON | CORE_PWRCTL_BUS_OFF)) {
+		ack |= CORE_PWRCTL_BUS_SUCCESS;
+	}
+	if (status & (CORE_PWRCTL_IO_LOW | CORE_PWRCTL_IO_HIGH)) {
+		ack |= CORE_PWRCTL_IO_SUCCESS;
+	}
+	for (retry = 0; retry < 10; retry++) {
+		core_wr(CORE_PWRCTL_CLEAR, status);
+		if (!(core_rd(CORE_PWRCTL_STATUS) & status)) {
+			break;
+		}
+		host_delay_us(1);
+	}
+	core_wr(CORE_PWRCTL_CTL, ack);
+}
+
 /* Take the controller over from the bootloader. */
 static int
 sdhci_take_over(void)
 {
 	uint16_t clk;
+	uint8_t ctrl, to_ctrl;
+	uint64_t deadline;
 
 	if (sdhci_core_check() != 0) {
 		return ENXIO;
 	}
+	core_wr(CORE_PWRCTL_MASK, 0);
+
 	/* Vendor clock register before HC mode, Linux's order. */
 	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_POR_VAL);
 	if (sdhci_enter_hc_mode() != 0) {
 		return ENXIO;
 	}
-	sdhci_select_hc_clock();
 
-	hc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
-	uint64_t deadline = host_now_ns() + 100000000ull;
-	while (hc_rd8(SDHCI_SOFTWARE_RESET) & (SDHCI_RESET_CMD | SDHCI_RESET_DATA)) {
+	sdhci_pwrctl_ack("stale");
+	ctrl = hc_rd8(SDHCI_HOST_CONTROL);
+
+	hc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
+	deadline = host_now_ns() + 100000000ull;
+	while (hc_rd8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_ALL) {
 		if (host_now_ns() > deadline) {
 			return ETIMEDOUT;
 		}
 		host_delay_us(5);
 	}
+	sdhci_pwrctl_ack("BUS_OFF");
 
-	/* PIO: select the (unused) SDMA field and keep bus width / speed. */
-	hc_wr8(SDHCI_HOST_CONTROL, (uint8_t)(hc_rd8(SDHCI_HOST_CONTROL) &
-	    ~SDHCI_CTRL_DMA_MASK));
+	sdhci_select_hc_clock();
+
+	hc_wr8(SDHCI_POWER_CONTROL, SDHCI_POWER_CONTROL_VAL);
+	sdhci_pwrctl_ack("BUS_ON");
+
+	hc_wr16(SDHCI_CLOCK_CONTROL, 0);
+	hc_wr16(SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN);
+	deadline = host_now_ns() + 150000000ull;
+	while (!(hc_rd16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE)) {
+		if (host_now_ns() > deadline) {
+			return ENXIO;
+		}
+		host_delay_us(5);
+	}
+	hc_wr16(SDHCI_CLOCK_CONTROL,
+	    SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE | SDHCI_CLOCK_CARD_EN);
+	clk = hc_rd16(SDHCI_CLOCK_CONTROL);
+	if (!(clk & SDHCI_CLOCK_CARD_EN)) {
+		return ENXIO;
+	}
+	sdhci_clock_output();
+
+	hc_wr8(SDHCI_HOST_CONTROL, (uint8_t)(ctrl & ~SDHCI_CTRL_DMA_MASK));
+	to_ctrl = hc_rd8(SDHCI_TIMEOUT_CONTROL);
+	if (to_ctrl == 0) {
+		hc_wr8(SDHCI_TIMEOUT_CONTROL, 0x0eu);
+	}
 
 	/* Polled operation: status enabled, interrupt signal not routed. */
 	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
 	hc_wr(SDHCI_SIGNAL_ENABLE, 0);
 	hc_wr(SDHCI_INT_STATUS, hc_rd(SDHCI_INT_STATUS));
 
-	clk = hc_rd16(SDHCI_CLOCK_CONTROL);
-	if (!(clk & SDHCI_CLOCK_CARD_EN)) {
-		if ((clk & (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE)) !=
-		    (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE)) {
-			return ENXIO;
-		}
-		hc_wr16(SDHCI_CLOCK_CONTROL, clk | SDHCI_CLOCK_CARD_EN);
-		clk = hc_rd16(SDHCI_CLOCK_CONTROL);
-		if (!(clk & SDHCI_CLOCK_CARD_EN)) {
-			return ENXIO;
-		}
-	}
-	sdhci_clock_output();
 	return 0;
 }
 
@@ -1134,11 +1249,19 @@ test_registers(void)
 	assert(CORE_HC_MODE == 0x78);
 	assert(CORE_PWRCTL_STATUS == 0xdc);
 	assert(CORE_PWRCTL_MASK == 0xe0);
+	assert(CORE_PWRCTL_CLEAR == 0xe4);
+	assert(CORE_PWRCTL_CTL == 0xe8);
+	assert(CORE_PWRCTL_BUS_OFF == 0x01);
+	assert(CORE_PWRCTL_BUS_ON == 0x02);
+	assert(CORE_PWRCTL_BUS_SUCCESS == 0x01);
+	assert(CORE_PWRCTL_IO_SUCCESS == 0x04);
 	assert(CORE_HC_MODE_EN == (1u << 0));
 	assert(CORE_FF_CLK_SW_RST_DIS == (1u << 13));
 
 	/* HC-mode takeover registers */
 	assert(SDHCI_HOST_VERSION == 0xfe);
+	assert(SDHCI_POWER_CONTROL == 0x29);
+	assert(SDHCI_POWER_CONTROL_VAL == 0x0b);
 	assert(SDHCI_CLOCK_INT_EN == 0x1);
 	assert(SDHCI_CLOCK_INT_STABLE == 0x2);
 	assert(SDHCI_CLOCK_CARD_EN == 0x4);
@@ -1179,13 +1302,15 @@ test_take_over(void)
 	assert((core_rd(CORE_HC_MODE) &
 	    (CORE_HC_MODE_EN | CORE_FF_CLK_SW_RST_DIS)) ==
 	    (CORE_HC_MODE_EN | CORE_FF_CLK_SW_RST_DIS));
-	/* Only CMD|DATA reset, and only once. */
-	assert(m.reset_value == (SDHCI_RESET_CMD | SDHCI_RESET_DATA));
+	/* RESET_ALL issued once and acknowledged */
+	assert(m.reset_value == SDHCI_RESET_ALL);
 	assert(m.reset_writes == 1);
-	/* A valid bootloader divider + open gate: 0x2C is not touched. */
-	assert(m.clock_writes == 0);
-	/* Command/data reset must not be RESET_ALL. */
-	assert((m.reset_value & SDHCI_RESET_ALL) == 0);
+	/* Power turned on (0x0B = 1.8V + bus on) and acknowledged */
+	assert(hc_rd8(SDHCI_POWER_CONTROL) == SDHCI_POWER_CONTROL_VAL);
+	assert(core_rd(CORE_PWRCTL_CTL) == CORE_PWRCTL_BUS_SUCCESS);
+	/* Clock stabilized and card clock gated on */
+	assert(mock_rd16(SDHCI_CLOCK_CONTROL) ==
+	    (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE | SDHCI_CLOCK_CARD_EN));
 	/* 8-bit bus preserved, DMA select cleared for PIO. */
 	assert((hc_rd8(SDHCI_HOST_CONTROL) & SDHCI_CTRL_8BITBUS) != 0);
 	assert((hc_rd8(SDHCI_HOST_CONTROL) & SDHCI_CTRL_DMA_MASK) == 0);
@@ -1204,19 +1329,9 @@ test_take_over(void)
 	assert((hc_rd(CORE_VENDOR_SPEC) & CORE_HC_SELECT_IN_EN) == 0);
 	assert(mock_hc_clocked());
 
-	/* A closed card-clock gate is reopened, divider left untouched. */
+	/* Dead GCC card clock: fail closed, RAM-disk boot survives. */
 	reset_mock();
-	mock_wr16(SDHCI_CLOCK_CONTROL,
-	    SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE);
-	assert(sdhci_take_over() == 0);
-	assert(m.clock_writes == 1);
-	assert(mock_rd16(SDHCI_CLOCK_CONTROL) ==
-	    (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE |
-	    SDHCI_CLOCK_CARD_EN));
-
-	/* No valid SDHCI divider at all: fail closed, RAM-disk boot survives. */
-	reset_mock();
-	mock_wr16(SDHCI_CLOCK_CONTROL, 0);
+	m.clock_stalled = 1;
 	assert(sdhci_take_over() == ENXIO);
 
 	/* An unclocked vendor core is not ours. */
@@ -1277,6 +1392,16 @@ test_clock_path(void)
 	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_POR_VAL);
 	hc_wr(CORE_DLL_CONFIG, CORE_CK_OUT_EN);
 	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
+	hc_wr8(SDHCI_POWER_CONTROL, SDHCI_POWER_CONTROL_VAL);
+	hc_wr16(SDHCI_COMMAND, (uint16_t)SDHCI_MAKE_CMD(0, 0));
+	assert((hc_rd(SDHCI_PRESENT_STATE) & SDHCI_CMD_INHIBIT) != 0);
+	assert(hc_rd(SDHCI_INT_STATUS) == 0);
+
+	/* Bus power off: command never completes, CMD_INHIBIT stuck */
+	reset_mock();
+	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_POR_VAL);
+	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
+	hc_wr8(SDHCI_POWER_CONTROL, 0);
 	hc_wr16(SDHCI_COMMAND, (uint16_t)SDHCI_MAKE_CMD(0, 0));
 	assert((hc_rd(SDHCI_PRESENT_STATE) & SDHCI_CMD_INHIBIT) != 0);
 	assert(hc_rd(SDHCI_INT_STATUS) == 0);

@@ -52,7 +52,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/santoni_sdhci.c
-@@ -0,0 +1,1641 @@
+@@ -0,0 +1,1727 @@
 +/*
 + * SANTONI internal eMMC 5.1 root device (polled SDHCI MSM v4, SDCC1).
 + *
@@ -183,6 +183,27 @@ new file mode 100644
 +#define CORE_PWRCTL_MASK        0xe0
 +#define CORE_PWRCTL_CLEAR       0xe4
 +#define CORE_PWRCTL_CTL         0xe8
++#define CORE_PWRCTL_BUS_OFF     0x00000001u
++#define CORE_PWRCTL_BUS_ON      0x00000002u
++#define CORE_PWRCTL_IO_LOW      0x00000004u
++#define CORE_PWRCTL_IO_HIGH     0x00000008u
++#define CORE_PWRCTL_INT_MASK    0x0000000fu
++#define CORE_PWRCTL_BUS_SUCCESS 0x00000001u
++#define CORE_PWRCTL_IO_SUCCESS  0x00000004u
++#define CORE_IO_PAD_PWR_SWITCH_EN 0x00008000u    /* BIT(15) */
++#define CORE_IO_PAD_PWR_SWITCH    0x00010000u    /* BIT(16) */
++
++#define SDHCI_TIMEOUT_CONTROL   0x2e
++#define SDHCI_HOST_CONTROL2     0x3e
++#define SDHCI_CTRL_4BITBUS      0x02u
++#define SDHCI_CTRL_VDD_180      0x0008u
++#define SDHCI_POWER_ON          0x01u
++#define SDHCI_POWER_180         0x0au
++#define SDHCI_POWER_CONTROL_VAL (SDHCI_POWER_180 | SDHCI_POWER_ON) /* 0x0b */
++
++#define PWRCTL_TIMEOUT_NS       (100ull * NSEC_PER_MSEC)
++#define RESET_TIMEOUT_NS        (100ull * NSEC_PER_MSEC)
++#define CLOCK_STABLE_TIMEOUT_NS (150ull * NSEC_PER_MSEC)
 +/*
 + * Qualcomm vendor-specific registers CORE_DLL_CONFIG (0x100), CORE_DLL_STATUS
 + * (0x108), CORE_VENDOR_SPEC (0x10c), CORE_VENDOR_SPEC_FUNC2 (0x110), and
@@ -192,9 +213,10 @@ new file mode 100644
 + * GENERICS 0x70, HC_MODE 0x78, PWRCTL 0xdc..0xe8).
 + * HC + 0x10c: vendor clock/DLL control (physically 0x07824a0c). Linux resets
 + * it to CORE_VENDOR_SPEC_POR_VAL before HC mode; bits 9:8 select HC datapath.
++ * POR value carries MCLK sel 2 (0xa9c) plus 1.8V pad power switch (0x18000).
 + */
 +#define CORE_VENDOR_SPEC        0x10c
-+#define CORE_VENDOR_SPEC_POR_VAL 0xa9cu
++#define CORE_VENDOR_SPEC_POR_VAL (0x00000a9cu | CORE_IO_PAD_PWR_SWITCH_EN | CORE_IO_PAD_PWR_SWITCH)
 +#define CORE_HC_MCLK_SEL_MASK   (3u << 8)
 +#define CORE_HC_MCLK_SEL_DFLT   (2u << 8)
 +#define CORE_HC_SELECT_IN_EN    0x00040000u     /* BIT(18) */
@@ -765,22 +787,87 @@ new file mode 100644
 +}
 +
 +/*
++ * Answer a pending CORE_PWRCTL request. The MSM core raises STATUS when a
++ * write changes bus power (POWER_CONTROL, RESET_ALL: BUS_ON/BUS_OFF) or the
++ * signalling voltage (HOST_CONTROL2[3]: IO_LOW/IO_HIGH) and waits for a
++ * matching SUCCESS bit in CORE_PWRCTL_CTL. We do not own VMMC/VQMMC - LK
++ * programmed them and the pad switch is already at the right level - so every
++ * request is answered SUCCESS, which is what Linux does for the voltages the
++ * SDHCI core switches by itself (sdhci_msm_handle_pwr_irq(): irq_ack |=
++ * CORE_PWRCTL_BUS_SUCCESS / CORE_PWRCTL_IO_SUCCESS).
++ *
++ * Status 0 is normal, not an error: the core only raises a request on a state
++ * *change*, and Linux likewise skips the wait when the requested state is
++ * already current. A request that never arrives is logged (Linux only warns
++ * too) and the boot continues - failing here would turn "LK already powered
++ * the card" into a dead eMMC.
++ */
++static void
++sdhci_pwrctl_ack(const char *what)
++{
++	uint64_t deadline;
++	uint32_t status, ack;
++	int retry;
++
++	nanoseconds_to_absolutetime(PWRCTL_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		status = core_rd(CORE_PWRCTL_STATUS) & CORE_PWRCTL_INT_MASK;
++		if (status || mach_absolute_time() > deadline) {
++			break;
++		}
++		delay(1);
++	}
++	if (!status) {
++		printf("SANTONI SDHCI: PWRCTL %s: no request (STATUS 0x%08x), "
++		    "already in that state\n", what,
++		    core_rd(CORE_PWRCTL_STATUS));
++		return;
++	}
++
++	ack = 0;
++	if (status & (CORE_PWRCTL_BUS_ON | CORE_PWRCTL_BUS_OFF)) {
++		ack |= CORE_PWRCTL_BUS_SUCCESS;
++	}
++	if (status & (CORE_PWRCTL_IO_LOW | CORE_PWRCTL_IO_HIGH)) {
++		ack |= CORE_PWRCTL_IO_SUCCESS;
++	}
++	/* The clear pulse can be lost while the core resets (Linux retries). */
++	for (retry = 0; retry < 10; retry++) {
++		core_wr(CORE_PWRCTL_CLEAR, status);
++		if (!(core_rd(CORE_PWRCTL_STATUS) & status)) {
++			break;
++		}
++		delay(1);
++	}
++	core_wr(CORE_PWRCTL_CTL, ack);
++	printf("SANTONI SDHCI: PWRCTL %s: STATUS 0x%08x -> CTL 0x%08x "
++	    "(ack only, VMMC/VQMMC stay LK's)\n", what, status,
++	    core_rd(CORE_PWRCTL_CTL));
++}
++
++/*
 + * Take the controller over from LK: enable the SDHCI register window, reset
-+ * only the command and data paths, then verify that the clock and bus
-+ * configuration the bootloader left behind is usable from the HC window.
++ * the HC block cleanly with RESET_ALL, turn on bus power, verify GCC card clock
++ * stability, and prepare polled status operation.
 + */
 +static int
 +sdhci_take_over(void)
 +{
 +	uint16_t clk;
-+	uint8_t ctrl;
++	uint8_t ctrl, to_ctrl;
 +	uint32_t mci_clk, mci_power, vendor;
++	uint64_t deadline;
 +	int error;
 +
 +	error = sdhci_core_check();
 +	if (error) {
 +		return error;
 +	}
++
++	/* Disable power IRQ generation on GIC while polled */
++	core_wr(CORE_PWRCTL_MASK, 0);
++
 +	/*
 +	 * Sample the legacy MCI window while it is still the active layout:
 +	 * LK drove SDCC1 entirely through it, and once HC mode is on these
@@ -788,11 +875,11 @@ new file mode 100644
 +	 */
 +	mci_power = core_rd(CORE_MCI_POWER);
 +	mci_clk = core_rd(CORE_MCI_CLK);
++
 +	/*
-+	 * Vendor clock register before HC mode, in Linux's order
-+	 * (sdhci_msm_probe: POR value, then HC_MODE_EN, then
-+	 * FF_CLK_SW_RST_DIS). LK never writes it, so on this hand-off it still
-+	 * selects "no clock" for the HC datapath.
++	 * Step 1: vendor clock and pad supply before HC mode, in Linux's order
++	 * (sdhci_msm_probe: POR value with 1.8V pad switches, then HC_MODE_EN,
++	 * then FF_CLK_SW_RST_DIS).
 +	 */
 +	vendor = hc_rd(CORE_VENDOR_SPEC);
 +	printf("SANTONI SDHCI: CORE_VENDOR_SPEC 0x%08x (MCLK sel %u, "
@@ -800,107 +887,103 @@ new file mode 100644
 +	    (vendor & CORE_HC_MCLK_SEL_MASK) >> 8, (vendor >> 1) & 1u,
 +	    CORE_VENDOR_SPEC_POR_VAL);
 +	hc_wr(CORE_VENDOR_SPEC, CORE_VENDOR_SPEC_POR_VAL);
++
++	/* Step 2: switch the core to SDHCI host controller mode */
 +	error = sdhci_enter_hc_mode();
 +	if (error) {
 +		return error;
 +	}
++
++	/* Drain any stale PWRCTL request firmware or reset left behind */
++	sdhci_pwrctl_ack("stale");
++
++	/* Save pre-reset host control to preserve LK's bus width */
++	ctrl = hc_rd8(SDHCI_HOST_CONTROL);
++
 +	/*
-+	 * The POR value already carries MCLK select 2, but re-assert the
-+	 * selection the way sdhci_msm_set_clock() does before every rate
-+	 * change: this is the clock the command shifter runs on.
++	 * Step 3: full reset of the HC block (LK sdhci_msm_init and Linux sdhci_init
++	 * do SOFT_RESET_ALL here). GCC clocks are outside the SDHCI reset domain.
 +	 */
++	hc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
++	nanoseconds_to_absolutetime(RESET_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (hc_rd8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_ALL) {
++		if (mach_absolute_time() > deadline) {
++			printf("SANTONI SDHCI: RESET_ALL timed out (0x%02x)\n",
++			    hc_rd8(SDHCI_SOFTWARE_RESET));
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	/* RESET_ALL turns off bus power; acknowledge the BUS_OFF request */
++	sdhci_pwrctl_ack("BUS_OFF");
++
++	/* Re-assert vendor clock selection in case core reset affected it */
 +	sdhci_select_hc_clock();
 +
-+	error = sdhci_reset_paths();
-+	if (error) {
-+		return error;
++	/*
++	 * Step 4: turn on 1.8V bus power and acknowledge BUS_ON request.
++	 * SDHCI power must precede card clock.
++	 */
++	hc_wr8(SDHCI_POWER_CONTROL, SDHCI_POWER_CONTROL_VAL);
++	sdhci_pwrctl_ack("BUS_ON");
++
++	/*
++	 * Step 5: card clock, proved live. MSM controller does not use an
++	 * internal divider (directly clocked by GCC), so divider bits stay 0.
++	 * Write 0, then INT_EN, poll INT_STABLE to prove MCLK is running, then CARD_EN.
++	 */
++	hc_wr16(SDHCI_CLOCK_CONTROL, 0);
++	hc_wr16(SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN);
++	nanoseconds_to_absolutetime(CLOCK_STABLE_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (!(hc_rd16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE)) {
++		if (mach_absolute_time() > deadline) {
++			printf("SANTONI SDHCI: SDHCI clock not stable "
++			    "(CLOCK_CONTROL 0x%04x): GCC SDC1 clock branch dead\n",
++			    hc_rd16(SDHCI_CLOCK_CONTROL));
++			return ENXIO;
++		}
++		delay(1);
++	}
++	hc_wr16(SDHCI_CLOCK_CONTROL,
++	    SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE | SDHCI_CLOCK_CARD_EN);
++	clk = hc_rd16(SDHCI_CLOCK_CONTROL);
++	printf("SANTONI SDHCI: card clock gate was closed, "
++	    "enabled (CLOCK_CONTROL 0x%04x)\n", clk);
++	if (!(clk & SDHCI_CLOCK_CARD_EN)) {
++		printf("SANTONI SDHCI: card clock gate did not latch "
++		    "(CLOCK_CONTROL 0x%04x)\n", clk);
++		return ENXIO;
 +	}
 +
-+	/* PIO: select the (unused) SDMA field, preserve bus width and speed. */
-+	ctrl = hc_rd8(SDHCI_HOST_CONTROL);
++	/* Route card clock out (DLL or bypass) */
++	sdhci_clock_output();
++
++	/* Step 6: restore bus width and clear DMA select for PIO */
 +	hc_wr8(SDHCI_HOST_CONTROL, (uint8_t)(ctrl & ~SDHCI_CTRL_DMA_MASK));
 +	if (!(ctrl & SDHCI_CTRL_8BITBUS)) {
-+		/*
-+		 * LK identified the eMMC on an 8-bit bus. A freshly decoded HC
-+		 * register bank reads back 1-bit here; forcing 8-bit could
-+		 * corrupt the data phase if LK really used 4-bit, so only
-+		 * report it: CMD13 and CMD9 still work, the first CMD8 read
-+		 * will show whether the data path is set up.
-+		 */
 +		printf("SANTONI SDHCI: host bus width not 8-bit "
 +		    "(HOST_CONTROL 0x%02x)\n", ctrl);
++	}
++	to_ctrl = hc_rd8(SDHCI_TIMEOUT_CONTROL);
++	if (to_ctrl == 0) {
++		hc_wr8(SDHCI_TIMEOUT_CONTROL, 0x0eu);
 +	}
 +
 +	/*
 +	 * Polled operation: status enable all ones, signal enable zero.
-+	 *
-+	 * SDHCI sets a status bit when the event happens, independent of this
-+	 * register (spec 2.2.16/2.2.17; QEMU's sdhci_read() returns the raw
-+	 * status as well), so 0x0 does not blind the polled loop and cannot be
-+	 * why CMD_INHIBIT stayed set. All ones costs nothing while
-+	 * SIGNAL_ENABLE is 0 - no interrupt is routed - and keeps the loop
-+	 * correct on cores that do gate the status bit behind this register.
 +	 */
 +	hc_wr(SDHCI_INT_ENABLE, 0xffffffffu);
 +	hc_wr(SDHCI_SIGNAL_ENABLE, 0);
 +	hc_wr(SDHCI_INT_STATUS, hc_rd(SDHCI_INT_STATUS));
 +
-+	clk = hc_rd16(SDHCI_CLOCK_CONTROL);
-+	printf("SANTONI SDHCI: CLOCK_CONTROL 0x%04x PRESENT_STATE 0x%08x "
-+	    "POWER_CONTROL 0x%02x\n", clk, hc_rd(SDHCI_PRESENT_STATE),
-+	    hc_rd8(SDHCI_POWER_CONTROL));
-+
-+	if (!(clk & SDHCI_CLOCK_CARD_EN)) {
-+		if ((clk & (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE)) ==
-+		    (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE)) {
-+			/*
-+			 * The divider is valid and the internal clock is
-+			 * stable, only the card-clock gate is closed. Open it
-+			 * without touching the frequency select, so the SDCLK
-+			 * rate LK programmed is preserved.
-+			 */
-+			uint16_t want = clk | SDHCI_CLOCK_CARD_EN;
-+
-+			hc_wr16(SDHCI_CLOCK_CONTROL, want);
-+			clk = hc_rd16(SDHCI_CLOCK_CONTROL);
-+			printf("SANTONI SDHCI: card clock gate was closed, "
-+			    "enabled (CLOCK_CONTROL 0x%04x)\n", clk);
-+			if (!(clk & SDHCI_CLOCK_CARD_EN)) {
-+				printf("SANTONI SDHCI: card clock gate did not "
-+				    "latch (CLOCK_CONTROL 0x%04x)\n", clk);
-+				return ENXIO;
-+			}
-+		} else {
-+			/*
-+			 * No valid divider: LK ran SDCC1 entirely through the
-+			 * MCI register set and the SDHCI clock path was never
-+			 * programmed. Recovering it needs the GCC SDC1 rate
-+			 * and the DLL sequence, which this driver does not own
-+			 * yet; fail non-fatally and keep RAM-disk boot alive.
-+			 */
-+			printf("SANTONI SDHCI: SDHCI clock not configured "
-+			    "(CLOCK_CONTROL 0x%04x): LK left the core in MCI "
-+			    "mode, clock bring-up required\n", clk);
-+			return ENXIO;
-+		}
-+	}
-+
-+	/*
-+	 * Route the card clock out: a locked DLL LK left behind, or the
-+	 * bypass path. A dead DLL selected as the source is indistinguishable
-+	 * from "no SDCLK reaches the card".
-+	 */
-+	sdhci_clock_output();
-+
-+	/*
-+	 * Log the vendor state the bootloader left behind: these are the
-+	 * registers that decide whether the HC block sees a card clock at all,
-+	 * and nothing else in this driver reads them on the success path.
-+	 */
 +	printf("SANTONI SDHCI: takeover complete (HC_MODE 0x%08x, "
-+	    "VENDOR_SPEC 0x%08x, legacy MCI_CLK 0x%08x, MCI_POWER 0x%08x)\n",
++	    "VENDOR_SPEC 0x%08x, legacy MCI_CLK 0x%08x, MCI_POWER 0x%08x, "
++	    "POWER_CONTROL 0x%02x, CLOCK_CONTROL 0x%04x, HOST_CONTROL 0x%02x)\n",
 +	    core_rd(CORE_HC_MODE), hc_rd(CORE_VENDOR_SPEC), mci_clk,
-+	    mci_power);
++	    mci_power, hc_rd8(SDHCI_POWER_CONTROL), clk,
++	    hc_rd8(SDHCI_HOST_CONTROL));
 +	return 0;
 +}
 +
@@ -1325,7 +1408,6 @@ new file mode 100644
 +		if (strcmp(name, "system") == 0) {
 +			se.sys_first_block = first;
 +			se.sys_nblocks = last - first + 1;
-+			continue;
 +		}
 +		if (strcmp(name, want) == 0) {
 +			se.first_block = first;
@@ -1357,6 +1439,10 @@ new file mode 100644
 +
 +	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK) {
 +		return EINVAL;
++	}
++	if (se.first_block == se.sys_first_block) {
++		printf("SANTONI SDHCI: refusing log write: SYSTEM partition is mounted root\n");
++		return EPERM;
 +	}
 +	if (se.sys_nblocks < SANTONI_LOG_SYSTEM_BLOCKS ||
 +	    lba < se.sys_first_block ||
