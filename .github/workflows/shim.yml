@@ -1,0 +1,47 @@
+name: riva-shim
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_run_id:
+        description: XNU workflow run ID to download kernel.development.santoni from
+        default: "39726300268"
+  push:
+    branches: [riva]
+    paths:
+      - "shim/**"
+      - "tools/**"
+      - ".github/workflows/shim.yml"
+
+jobs:
+  shim:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang lld llvm python3
+
+      - name: Download prebuilt XNU kernel from run ${{ inputs.kernel_run_id || '39726300268' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download ${{ inputs.kernel_run_id || '39726300268' }} -R "${{ github.repository }}" -n xnu-kernel -D xnu/out
+          ls -la xnu/out
+
+      - name: Build riva shim-boot.img
+        run: |
+          cd shim
+          bash build.sh ../xnu/out/kernel.development.santoni
+          sha256sum out/shim-boot.img | tee out/shim-boot.img.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: riva-shim-boot
+          path: |
+            shim/out/shim-boot.img
+            shim/out/shim-boot.img.sha256
+            shim/out/santoni.adt
+          if-no-files-found: error

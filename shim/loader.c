@@ -148,6 +148,7 @@ static uintptr_t adt_walk_fix_cpus(uintptr_t base, uintptr_t off, uintptr_t tota
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+#if !__STDC_HOSTED__
 	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
 
 	/*
@@ -158,7 +159,9 @@ const char *loader_boot(uintptr_t dtb)
 		rd_start = emb;
 		rd_end = emb + 0x8000000;
 		con_hex("EMBED", emb);
-	} else {
+	} else
+#endif
+	{
 		if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 		    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 			return "no initrd in /chosen";
