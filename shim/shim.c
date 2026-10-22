@@ -17,9 +17,9 @@
 static volatile uint32_t irq_count;
 static volatile uint32_t last_intid;
 
-#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
+#define IMEM_RESTART_REASON	0x0860065cUL	/* qcom,msm-imem@8600000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0440b000UL
+#define PSHOLD			0x004ab000UL
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_CPU_SUSPEND	0xc4000001UL
@@ -32,7 +32,7 @@ static volatile uint32_t last_intid;
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 #define SMCCC_VERSION		0x80000000UL
 
-#define NR_CPUS			8
+#define NR_CPUS			4
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
@@ -44,7 +44,7 @@ static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; 
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
+static inline uint64_t cpu_mpidr(int i) { return 0x100UL | (i & 3); }
 
 static volatile uint64_t sec_mpidr[NR_CPUS];
 
@@ -186,7 +186,7 @@ void shim_main(uint64_t dtb)
 
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "santoni bare-metal shim");
+	con_str("SHIM", "riva bare-metal shim");
 
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
@@ -244,7 +244,7 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "santoni phase 2");
+	con_str("SHIM", "riva phase 2");
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);

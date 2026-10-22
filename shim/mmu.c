@@ -107,8 +107,9 @@ int mmu_enable(struct mmu_info *info)
 	zero_table(l2_0);
 	for (uint64_t i = 0; i < NENT; i++) {
 		uint64_t pa = i << L2_BLK_SHIFT;
-		/* Lower 512 MiB is MMIO / GIC; upper 512 MiB (0x20000000 - 0x3FFFFFFF) is DRAM */
-		uint64_t flags = (pa < 0x20000000UL) ? DEV_FLAGS : WB_FLAGS;
+		/* Only map 0x20000000+ as Normal WB if the shim was loaded in GiB 0 (3GB santoni);
+		 * on 2GB riva, DRAM starts at 0x80000000 so keep GiB 0 strictly Device-nGnRnE. */
+		uint64_t flags = (pa >= 0x20000000UL && img_lo < 0x40000000UL) ? WB_FLAGS : DEV_FLAGS;
 		l2_0[i] = pa | flags | D_BLOCK;
 	}
 

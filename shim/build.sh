@@ -63,9 +63,13 @@ else
 	fi
 fi
 
-# Append Santoni Qualcomm device tree table (29 DTBs including msm8940-xiaomi-santoni)
+# Append Riva / Santoni Qualcomm device tree table
 # so Qualcomm LK finds the DTB at kernel_addr + image_size
-if [ -f ../resources/santoni_appended_dtbs.bin ]; then
+if [ -f board/riva_appended_dtbs.bin ]; then
+	cat board/riva_appended_dtbs.bin >> out/Image
+elif [ -f ../resources/riva_appended_dtbs.bin ]; then
+	cat ../resources/riva_appended_dtbs.bin >> out/Image
+elif [ -f ../resources/santoni_appended_dtbs.bin ]; then
 	cat ../resources/santoni_appended_dtbs.bin >> out/Image
 fi
 

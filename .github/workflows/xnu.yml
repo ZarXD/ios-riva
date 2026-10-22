@@ -16,9 +16,11 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main, santoni]
+    branches: [main, santoni, riva]
     paths:
       - "xnu/patches/**"
+      - "shim/**"
+      - "tools/**"
       - ".github/workflows/xnu.yml"
 
 
@@ -176,3 +178,36 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+  # riva (Redmi 5A, MSM8917): same SANTONI kernel, riva shim + ADT + appended DTBs
+  shim:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang lld llvm python3
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel
+          path: xnu/out
+
+      - name: Build shim-boot.img
+        run: |
+          ls -la xnu/out
+          cd shim
+          bash build.sh ../xnu/out/kernel.development.santoni
+          sha256sum out/shim-boot.img | tee out/shim-boot.img.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: riva-shim-boot
+          path: |
+            shim/out/shim-boot.img
+            shim/out/shim-boot.img.sha256
+            shim/out/santoni.adt
+          if-no-files-found: error

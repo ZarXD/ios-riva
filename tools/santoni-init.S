@@ -166,16 +166,16 @@ path:
 	.asciz	"/dev/console"
 hello:
 	.ascii	"\n========================================\n"
-	.ascii	"*** SANTONI userspace: init running as PID "
+	.ascii	"*** RIVA userspace: init running as PID "
 hello_tail:
 	.ascii	" ***\n"
 alive:
-	.ascii	"SANTONI init: still alive (tick)\n"
+	.ascii	"RIVA init: still alive (tick)\n"
 alive_end:
 emmc_path:
 	.asciz	"/dev/remmcroot0"
 emmc_msg:
-	.ascii	"SANTONI userspace: read eMMC LBA 0: ["
+	.ascii	"RIVA userspace: read eMMC LBA 0: ["
 emmc_msg_end:
 emmc_tail:
 	.ascii	"]\n"
