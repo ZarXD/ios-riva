@@ -90,9 +90,28 @@
       - PID 1 (`tools/santoni-init.S`) opened `/dev/remmcroot0` (`SYS_open` succeeded!) and called `SYS_read(fd, sp, 512)` to read LBA 0 of `userdata` (`0x960000`).
       - `santoni_sdhci_strategy()` read sector `0x960000` from the Samsung eMMC into `bounce` (`0xfffffffb1f5e6000`) — and the first 64 bytes of `userdata` are visible right in the CPU registers (`x8 = 0x6b75043807bebe00`, `x9 = 0x7507fefe8110c603`, ..., `x15 = 0x000621eaa4f30200`)!
       - Then `memcpy(vaddr + done, bounce + skip, want)` faulted at `x0 = 0x000000016fdffbe0` (`esr = 0x9600004f`, Level 3 Permission Fault on Write) because `physio()` on a character device (`/dev/remmcroot0`) leaves `bp->b_datap` (`vaddr`) as a raw `TTBR0` userspace virtual address (`< 0xffffff0000000000ULL`), and in XNU on ARM64 only `copyout()` / `copyin()` are listed in `copyio_recover_table` (`COPYIO_RECOVER_RANGE`) so `sleh.c` can invoke `vm_fault()` on an unfaulted user stack page.
-  - **Boot 7 Fix:**
-    1. In `santoni_sdhci_strategy()`, use `copyout()` / `copyin()` whenever `(uintptr_t)vaddr < 0xffffff0000000000ULL` (character device `physio` with a userspace `TTBR0` address) and `memcpy()` for kernel addresses (`>= 0xffffff0000000000ULL`, block device buffer cache).
-    2. In `tools/santoni-init.S`, also pre-touch `[sp]` and `[sp, #512]` after `sub sp, sp, #544`.
+  - **Boot 7 on Physical Redmi 5A (`riva`) (`shim-boot.img` SHA256 `504604bb...`, commit `b63ace4`, `Screenshot 2026-10-22 154714.png`):**
+    - **PHASE 4 COMPLETE — 100% END-TO-END eMMC 5.1 + GPT PARTITION PROBE + USERSPACE `/dev/remmcroot0` SECTOR READ WITH ZERO PANICS!**
+    - Exact hardware console lines from `Screenshot 2026-10-22 154714.png`:
+      ```text
+      SANTONI SDHCI: GCC CFG_RCGR 0x00000205 -> 0x0000021f (same PLL /16)
+      SANTONI SDHCI: switched card to 8-bit HS SDR (R1 0x00000900)
+      SANTONI SDHCI: eMMC 5.1, 14910 MiB (30535680 x 512-byte sectors)
+      SANTONI SDHCI: "system" first block 0x101000, 3072 MiB (console log area available)
+      SANTONI SDHCI: "userdata" first block 0x960000, 10109 MiB, read-only
+      BSD root: md0, major 1, minor 0
+      Serial keyboard started
+      vm_free_delayed_pages: initialized 0 free pages
+      VM Swap Subsystem is ON
+      No POST boot-arg set.
+      load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+      load_init_program: attempting to load /sbin/launchd
+
+      ========================================
+      *** RIVA userspace: init running as PID 1 ***
+      RIVA userspace: read eMMC LBA 0: [fa b0 00 10 0e d0 bc 00]
+      ```
+    - Note: the 8 bytes `[fa b0 00 10 0e d0 bc 00]` printed by userspace PID 1 match `x12 = 0x00bcd00e1000b0fa` (little-endian) from Boot 6's register dump, proving bit-exact sector reads from `userdata` (`LBA 0x960000`) through `/dev/remmcroot0` into userspace!
 
 ## SDHCI review fixes applied to the 0142/0143 rewrite (2026-10-22, upstream `c9f7c07`): BOARD_VAL, restore-controller rung 3, synced mock
 
