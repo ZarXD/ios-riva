@@ -52,7 +52,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/santoni_sdhci.c
-@@ -0,0 +1,1727 @@
+@@ -0,0 +1,1760 @@
 +/*
 + * SANTONI internal eMMC 5.1 root device (polled SDHCI MSM v4, SDCC1).
 + *
@@ -166,10 +166,10 @@ new file mode 100644
 + * controller never shifted the command at all" (nothing but the software
 + * deadline), which is exactly the ambiguity a bare timeout leaves.
 + */
-+#define SDHCI_INT_CMD_INDEX     0x00800000u
-+#define SDHCI_INT_CMD_END_BIT   0x01000000u
-+#define SDHCI_INT_CMD_CRC       0x02000000u
-+#define SDHCI_INT_CMD_TIMEOUT   0x04000000u     /* no response from the card */
++#define SDHCI_INT_CMD_TIMEOUT   0x00010000u     /* no response from the card */
++#define SDHCI_INT_CMD_CRC       0x00020000u
++#define SDHCI_INT_CMD_END_BIT   0x00040000u
++#define SDHCI_INT_CMD_INDEX     0x00080000u
 +
 +/* ------------------------------------------ Qualcomm MSM v4 core registers */
 +#define SDHCI_HC_OFFSET         0x900           /* HC base - core base */
@@ -269,6 +269,8 @@ new file mode 100644
 +	uint64_t sys_first_block, sys_nblocks;  /* "system" partition, 512-byte sectors */
 +	uint32_t sec_count;                     /* EXT_CSD SEC_COUNT, 512-byte units */
 +	uint32_t rca;                           /* RCA the card answered with */
++	uint32_t cid[4], csd[4];                /* Standby-state R2 responses */
++	bool have_cid_csd;
 +	uint32_t secsize;                       /* logical sector size for BSD */
 +	bool writable;                          /* boot-arg emmcrw=1 */
 +	int bmajor, cmajor;
@@ -431,6 +433,9 @@ new file mode 100644
 +
 +		if (st & SDHCI_INT_ERR) {
 +			hc_wr(SDHCI_INT_STATUS, st);
++			printf("SANTONI SDHCI: data error (INT_STATUS 0x%08x, "
++			    "HOST_CONTROL 0x%02x)\n", st,
++			    hc_rd8(SDHCI_HOST_CONTROL));
 +			return EIO;
 +		}
 +		if (st & bit) {
@@ -456,6 +461,9 @@ new file mode 100644
 +
 +		if (st & SDHCI_INT_ERR) {
 +			hc_wr(SDHCI_INT_STATUS, st);
++			printf("SANTONI SDHCI: data error (INT_STATUS 0x%08x, "
++			    "HOST_CONTROL 0x%02x)\n", st,
++			    hc_rd8(SDHCI_HOST_CONTROL));
 +			return EIO;
 +		}
 +		if (st & SDHCI_INT_TC) {
@@ -1045,6 +1053,19 @@ new file mode 100644
 +		printf("SANTONI SDHCI: card state %u (not TRAN), R1 0x%08x\n",
 +		    state, *r1);
 +		if (state == 3) {
++			/*
++			 * JESD84-B51 6.10.4: CMD9 (SEND_CSD) and CMD10
++			 * (SEND_CID) are valid only in Standby state (3); a
++			 * card in Transfer state (4) ignores both. Read them
++			 * here before CMD7 selects the card into TRAN.
++			 */
++			if (!se.have_cid_csd &&
++			    sdhci_read_response128(10, se.rca << 16, se.cid) == 0 &&
++			    sdhci_read_response128(9, se.rca << 16, se.csd) == 0) {
++				se.have_cid_csd = true;
++			} else if (!se.have_cid_csd) {
++				(void)sdhci_reset_paths();
++			}
 +			printf("SANTONI SDHCI: selecting RCA %u (CMD7)\n",
 +			    se.rca);
 +			if (sdhci_select_card(se.rca) != 0) {
@@ -1182,13 +1203,18 @@ new file mode 100644
 +		return error;
 +	}
 +
-+	error = sdhci_read_response128(10, se.rca << 16, cid);
-+	if (error) {
-+		return error;
-+	}
-+	error = sdhci_read_response128(9, se.rca << 16, csd);
-+	if (error) {
-+		return error;
++	if (se.have_cid_csd) {
++		memcpy(cid, se.cid, sizeof(cid));
++		memcpy(csd, se.csd, sizeof(csd));
++	} else {
++		error = sdhci_read_response128(10, se.rca << 16, cid);
++		if (error) {
++			(void)sdhci_reset_paths();
++		}
++		error = sdhci_read_response128(9, se.rca << 16, csd);
++		if (error) {
++			(void)sdhci_reset_paths();
++		}
 +	}
 +
 +	/*
@@ -1219,6 +1245,13 @@ new file mode 100644
 +	 * field at offset 212, in 512-byte units. */
 +	dma_sync(SDHCI_BLOCK, TRUE);
 +	error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
++	if (error) {
++		uint8_t hc_ctrl = hc_rd8(SDHCI_HOST_CONTROL) ^ SDHCI_CTRL_8BITBUS;
++		printf("SANTONI SDHCI: CMD8 retry with HOST_CONTROL 0x%02x\n",
++		    hc_ctrl);
++		hc_wr8(SDHCI_HOST_CONTROL, hc_ctrl);
++		error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
++	}
 +	if (error) {
 +		printf("SANTONI SDHCI: no extended CSD (%d), continuing\n", error);
 +	} else {

@@ -94,10 +94,10 @@
 #define SDHCI_INT_BRR          0x00000020u  /* buffer read ready */
 #define SDHCI_INT_ERR          0x00008000u
 /* Specific error bits behind SDHCI_INT_ERR (SDHCI 3.0, dword at 0x30). */
-#define SDHCI_INT_CMD_INDEX    0x00800000u
-#define SDHCI_INT_CMD_END_BIT  0x01000000u
-#define SDHCI_INT_CMD_CRC      0x02000000u
-#define SDHCI_INT_CMD_TIMEOUT  0x04000000u
+#define SDHCI_INT_CMD_TIMEOUT  0x00010000u
+#define SDHCI_INT_CMD_CRC      0x00020000u
+#define SDHCI_INT_CMD_END_BIT  0x00040000u
+#define SDHCI_INT_CMD_INDEX    0x00080000u
 
 #define SDHCI_HOST_VERSION     0xfe
 #define SDHCI_CLOCK_INT_EN     0x0001u
