@@ -52,7 +52,7 @@ diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/santoni_sdhci.c
-@@ -0,0 +1,1954 @@
+@@ -0,0 +1,1967 @@
 +/*
 + * SANTONI internal eMMC 5.1 root device (polled SDHCI MSM v4, SDCC1).
 + *
@@ -553,6 +553,18 @@ new file mode 100644
 +	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK) {
 +		return EINVAL;
 +	}
++	if (index == 18 && count == 1) {
++		index = 17;
++	}
++	if (index == 18) {
++		error = sdhci_cmd(23, count, 0,
++		    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
++		    NULL);
++		if (error) {
++			sdhci_recover();
++			return error;
++		}
++	}
 +	hc_wr16(SDHCI_BLOCK_SIZE, SDHCI_MAKE_BLKSZ(0, SDHCI_BLOCK));
 +	hc_wr16(SDHCI_BLOCK_COUNT, (uint16_t)(index == 18 ? count : 1));
 +
@@ -583,17 +595,16 @@ new file mode 100644
 +		sdhci_recover();
 +		return error;
 +	}
-+	/*
-+	 * BLK_CNT_EN is always set, so the card stops after the programmed block
-+	 * count: a CMD12 here would abort a transfer that already completed and
-+	 * can poison the next command.
-+	 */
++	if (index == 18 &&
++	    (hc_rd(SDHCI_PRESENT_STATE) & (SDHCI_DATA_INHIBIT | 0x00000700u))) {
++		sdhci_recover();
++	}
 +	return 0;
 +}
 +
 +/*
-+ * Polled PIO write of count 512-byte blocks (CMD25). BLK_CNT_EN stops the
-+ * card at the block count, so no CMD12 is issued after a successful transfer.
++ * Polled PIO write of count 512-byte blocks (CMD25). CMD23 sets the predefined
++ * block count on the eMMC card so it stops after count blocks.
 + */
 +static int
 +sdhci_write_pio(uint32_t lba, uint32_t count, const void *buf)
@@ -603,6 +614,12 @@ new file mode 100644
 +
 +	if (count == 0 || count > BOUNCE_SIZE / SDHCI_BLOCK) {
 +		return EINVAL;
++	}
++	error = sdhci_cmd(23, count, 0,
++	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, NULL);
++	if (error) {
++		sdhci_recover();
++		return error;
 +	}
 +	hc_wr16(SDHCI_BLOCK_SIZE, SDHCI_MAKE_BLKSZ(0, SDHCI_BLOCK));
 +	hc_wr16(SDHCI_BLOCK_COUNT, (uint16_t)count);
@@ -630,6 +647,9 @@ new file mode 100644
 +	if (error) {
 +		sdhci_recover();
 +		return error;
++	}
++	if (hc_rd(SDHCI_PRESENT_STATE) & (SDHCI_DATA_INHIBIT | 0x00000700u)) {
++		sdhci_recover();
 +	}
 +	return 0;
 +}
@@ -1392,16 +1412,9 @@ new file mode 100644
 +
 +	/* Extended CSD (CMD8): SEC_COUNT is the last 32-bit little-endian
 +	 * field at offset 212, in 512-byte units. */
++	sdhci_switch_to_hs_sdr(true, false);
 +	dma_sync(SDHCI_BLOCK, TRUE);
 +	error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
-+	if (error) {
-+		sdhci_switch_to_hs_sdr(false, false);
-+		error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
-+	}
-+	if (error) {
-+		sdhci_switch_to_hs_sdr(true, false);
-+		error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));
-+	}
 +	if (error) {
 +		sdhci_switch_to_hs_sdr(false, true);
 +		error = sdhci_read_pio(8, 0, 1, (void *)(se.dma + DMA_BOUNCE));

@@ -47,12 +47,30 @@
     ```
   - **Why `CMD5` timed out on RX in Boot 4 after succeeding in Boot 2 and Boot 3:**
     1. **`HOST_CONTROL2 = 0x0003` (`UHS_SDR104 / HS200` with DLL powered down):** Upstream `c9787f2` saved `handoff_hc2` (`0x0003` on `riva`, where bits `[2:0] = 3` select `SDR104 / HS200`) before `RESET_ALL` and restored it afterward. In Boot 2 and Boot 3, `RESET_ALL` cleared `HOST_CONTROL2` to **`0x0000`** (`SDR12` legacy SDR). On Qualcomm SDCC v4, setting `HOST_CONTROL2` UHS mode to `3` (`SDR104 / HS200`) while `CORE_DLL_CONFIG` has `DLL_EN=0, PDN=1, RST=1` routes the RX sampling clock through the powered-down tuning DLL! Notice `PRESENT_STATE` on `CMD5 (RCA 2)` changed from `0x01f80001` to **`0x01e80007`** (`DAT0` level bit 20 went `1 -> 0` and `DAT_ACTIVE` / `DATA_INHIBIT` asserted): the eMMC card **actually received `CMD5` and pulled `DAT0` low to wake up**, but the host RX path was deafened by `HOST_CONTROL2 = 0x0003` (and switching `CFG_RCGR` off `GPLL4` `src_sel = 2` during takeover)!
-  - **Boot 5 Fix:**
-    1. In `sdhci_take_over()`, clear the UHS mode bits `[2:0]` (`0x0007u`) from `handoff_hc2` whenever `!(hc_rd(CORE_DLL_CONFIG) & CORE_DLL_EN)` (`0x0003 -> 0x0000` on `riva`, while preserving `0x0008` in `test_sdhci_mock.c`), and leave `GCC_SDCC1_APPS_CFG_RCGR` untouched at `0x00000205` during takeover so `CMD5` -> `CMD13` -> `CMD10`/`CMD9` (without `SDHCI_CMD_INDEX`) -> `CMD7` run in the exact controller state proven by Boot 2 and Boot 3.
-    2. In `sdhci_card_check()`, once the card is in Transfer State (`state 4`), try `CMD8` (`SEND_EXT_CSD`) with a 3-stage fallback:
-       - Stage 1: `sdhci_switch_to_hs_sdr(false, false)` — send `CMD6` (`0x03b90100u` `HS_TIMING=1` High-Speed SDR + `0x03b70200u` `BUS_WIDTH=2` 8-bit SDR) with `HOST_CONTROL2 = se.saved_hc2` (`0x0000`) and `HOST_CONTROL = 0x20`.
-       - Stage 2: `sdhci_switch_to_hs_sdr(true, false)` — divide the active `GPLL4` clock in `GCC_SDCC1_APPS_CFG_RCGR` (`(old_cfg & ~0x1fu) | 0x1fu`, i.e. `0x00000205 -> 0x0000021f`, keeping `src_sel = 2`!) and re-issue `CMD6` for 8-bit HS SDR.
-       - Stage 3: `sdhci_switch_to_hs_sdr(false, true)` — switch card (`CMD6` `0x03b70000u` `BUS_WIDTH=0`) and host (`HOST_CONTROL = 0x00`) to 1-bit HS SDR on `DAT0`.
+  - **Boot 5 on Physical Redmi 5A (`riva`) (`shim-boot.img` SHA256 `c90e3fda...`, commit `04ef7c5`, `Screenshot 2026-10-22 144223.png`):**
+    - **MAJOR MILESTONE — `CMD5`, `CMD10` (`CID`), `CMD9` (`CSD`), `CMD6` (`8-bit HS SDR`), `CMD8` (`EXT_CSD`), AND `LBA 1` (`GPT Header` + CRC32) ALL SUCCEEDED ON HARDWARE!**
+    - Exact hardware console lines from `Screenshot 2026-10-22 144223.png`:
+      ```text
+      SANTONI SDHCI: CMD5 awake RCA 2 -> R1 0x000015b0
+      SANTONI SDHCI: CMD13 after wake-up (R1 0x00000700, state 3)
+      SANTONI SDHCI: card state 3 (not TRAN), R1 0x00000700
+      SANTONI SDHCI: selecting RCA 2 (CMD7)
+      SANTONI SDHCI: eMMC MID 0x15 CBX 0x01 OID 0x00 PNM "QE63MB" rev 0.3 S/N 0x3c5d9bca MDT 0xb4 CSD 0xd0270132
+      ...
+      SANTONI SDHCI: GCC CFG_RCGR 0x00000205 -> 0x0000021f (same PLL /16)
+      SANTONI SDHCI: switched card to 8-bit HS SDR (R1 0x00000900)
+      SANTONI SDHCI: eMMC 5.1, 14910 MiB (30535680 x 512-byte sectors)
+      SANTONI SDHCI: command 18 failed (arg 0x00000002, INT_STATUS 0x00218000 cmd-timeout, PRESENT_STATE 0x01080207)
+      ```
+    - **What Boot 5 proved:**
+      1. Clearing `HOST_CONTROL2` UHS bits `[2:0]` (`0x0003 -> 0x0000`) + removing `SDHCI_CMD_INDEX` on `R2` responses made `CMD10` (`CID`) and `CMD9` (`CSD`) work on the first try: **Samsung `QE63MB` rev 0.3, S/N `0x3c5d9bca`**.
+      2. Dividing the active `GPLL4` (`src_sel = 2`) by `/16` (`CFG_RCGR: 0x00000205 -> 0x0000021f`) and sending `CMD6` (`HS_TIMING=1`, `BUS_WIDTH=2`) switched the card cleanly to 8-bit HS SDR (`R1 0x00000900`).
+      3. `CMD8` (`SEND_EXT_CSD`) read all 512 bytes over the 8-bit data bus and decoded `30,535,680` sectors (**14,910 MiB**).
+      4. `santoni_sdhci_read_blocks(1, 1, b)` **succeeded**, read **LBA 1 (the Primary GPT Header `"EFI PART"`)**, verified its **IEEE 802.3 CRC32**, and extracted `hdr.partition_entry_lba = 2` (`0x00000002`).
+      5. **Why `LBA 2` (`command 18`, `arg 0x00000002`) failed with `PRESENT_STATE 0x01080207`:** `LBA 1` (`count = 1`) was read using `CMD18` (`READ_MULTIPLE_BLOCK`) without `CMD17`, `CMD23` (`SET_BLOCK_COUNT`), or `CMD12` (`STOP_TRANSMISSION`). Per JEDEC eMMC 5.1 (JESD84-B51 6.6.17), `SDHCI_BLOCK_COUNT` is a host-only register; an eMMC chip given `CMD18` without `CMD23` keeps streaming blocks indefinitely in `DATA` state (`PRESENT_STATE 0x01080207` = `READ_TRANSFER_ACTIVE | DAT_ACTIVE | DATA_INHIBIT`).
+  - **Boot 6 Fix:**
+    1. Call `sdhci_switch_to_hs_sdr(true, false)` directly before `CMD8` so there are zero noisy 384 MHz errors.
+    2. In `sdhci_read_pio()`, use single-block `CMD17` (`READ_SINGLE_BLOCK`) when `index == 18 && count == 1`, and precede multi-block `CMD18` (`count > 1`) and `CMD25` (`sdhci_write_pio()`) with `CMD23` (`SET_BLOCK_COUNT`, `arg = count`) so the Samsung eMMC chip terminates every multi-block transfer after `count` blocks and returns cleanly to `TRAN` (`state 4`).
 
 ## SDHCI review fixes applied to the 0142/0143 rewrite (2026-10-22, upstream `c9f7c07`): BOARD_VAL, restore-controller rung 3, synced mock
 
